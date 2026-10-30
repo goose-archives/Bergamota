@@ -1,0 +1,241 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 204207f..6367b37 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -64,6 +64,26 @@ void sweet_touch_init(void);
+ #define NVT_RECORD       6u
+ #define NVT_EMPTY_RELEASE 3u  /* empty frames before an unannounced release */
+ #define NVT_BAD_RELEASE   20u /* torn frames in a row before a forced release */
++#define TOUCH_ST         5
++/* ST FingerTipS (Linux stmfts.c; Mi 8 "st,fts") */
++#define ST_ADDR           0x49u
++#define ST_READ_INFO      0x80u
++#define ST_READ_STATUS    0x84u
++#define ST_READ_ALL_EVENT 0x86u
++#define ST_MT_SENSE_ON    0x93u
++#define ST_SYSTEM_RESET   0xa0u
++#define ST_CLEAR_EVENTS   0xa1u
++#define ST_INFO_LEN       8u
++#define ST_STATUS_LEN     4u
++#define ST_EVENT_SIZE     8u
++#define ST_EVENTS_PER_READ 8u
++#define ST_EV_NO_EVENT    0x00u
++#define ST_EV_ENTER       0x03u
++#define ST_EV_LEAVE       0x04u
++#define ST_EV_MOTION      0x05u
++#define ST_EV_KEY         0x0eu
++#define ST_EV_DEBUG       0xdbu
++#define MXT_ADDR          0x4au
+ 
+ /* Per-board wiring of the touch bus; the GENI SE programming is common. */
+ struct touch_board {
+@@ -81,6 +101,10 @@ static const struct touch_board touch_beryllium = {
+ 	"SE14", 0x00a98000u, 0x18738u, (0x0fu << 18) | (1u << 28), 0x18734u,
+ 	33, 34, 2, 31, 32, 1080, 2246, false,
+ };
++static const struct touch_board touch_dipper = {
++	"SE14", 0x00a98000u, 0x18738u, (0x0fu << 18) | (1u << 28), 0x18734u,
++	33, 34, 2, 31, 32, 1080, 2248, false,
++};
+ static const struct touch_board *tb = &touch_sweet;
+ /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+ #define GOODIX_PID_REG   0x4022u
+@@ -984,6 +1008,150 @@ touch_beryllium_start(void)
+ 	return true;
+ }
+ 
++/*
++ * Xiaomi Mi 8: ST FingerTipS. The controller keeps its firmware in flash, so
++ * nothing is uploaded here: release reset (shared with nothing else on the
++ * Mi 8), read the 8-byte system info block, drain what ABL/reboot left in the
++ * event stack and enable multi-touch sensing. Linux stmfts.c stmfts_power_on /
++ * stmfts_configure do the same with IRQ waits; here every step is polled.
++ */
++static int
++touch_st_info(uint8_t *info)
++{
++	memset(info, 0xa5, ST_INFO_LEN);
++	return touch_read(ST_ADDR, ST_READ_INFO, false, info, ST_INFO_LEN);
++}
++
++static int
++touch_st_present(void)
++{
++	uint8_t id = 0;
++	return touch_read(MXT_ADDR, 0, false, &id, 1);
++}
++
++static bool
++touch_dipper_start(void)
++{
++	uint8_t info[ST_INFO_LEN], status[ST_STATUS_LEN];
++
++	printf("SWEET TOUCH: TLMM rst%u=%#x/%#x irq%u=%#x/%#x sda=%#x scl=%#x\n",
++	    tb->rst, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->rst)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->rst)),
++	    tb->irq, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->irq)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)));
++	/* fts,irq-flags = 0x2008: ONESHOT | TRIGGER_LOW, so idle high, low = event */
++	touch_gpio(tb->irq, 0, 3, 0, false, false);
++	if (st.bitbang) {
++		touch_gpio(tb->sda, 0, 0, 0, false, false);
++		touch_gpio(tb->scl, 0, 0, 0, false, false);
++		touch_wr(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 8u, (1u << 4) | (3u << 2) | (1u << 1));
++		touch_wr(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 0xcu, 0);
++	} else {
++		touch_gpio(tb->sda, tb->mux, 0, 0, false, false);
++		touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
++	}
++	touch_gpio(tb->rst, 0, 0, 0, true, true);         /* reset released */
++	touch_wait(50);
++	st.probing = true;
++	int err = touch_st_info(info);
++	if (err) {
++		printf("SWEET TOUCH: ST FTS silent (%d); pulsing reset\n", err);
++		touch_gpio(tb->rst, 0, 0, 0, true, false);
++		touch_wait(10);
++		touch_gpio(tb->rst, 0, 0, 0, true, true);
++		touch_wait(300);
++		err = touch_st_info(info);
++	}
++	printf("SWEET TOUCH: probe ST FTS at %#x: err=%d fw=%u chip=%#x raw=%02x %02x %02x %02x\n",
++	    ST_ADDR, err, touch_be16(info + 2), touch_be16(info + 6),
++	    info[0], info[1], info[2], info[3]);
++	if (err || st.dead) {
++		int mxt = touch_st_present();
++		printf("SWEET TOUCH: no ST FTS at %#x (err=%d dead=%d); Atmel MXT at %#x err=%d%s\n",
++		    ST_ADDR, err, st.dead, MXT_ADDR, mxt,
++		    mxt ? "" : " (present, no driver yet)");
++		st.probing = false;
++		return false;
++	}
++	/* Drain the stack (CONTROLLER_READY after a reset, ABL leftovers), then sense. */
++	uint8_t drain[ST_EVENT_SIZE * ST_EVENTS_PER_READ];
++	for (unsigned i = 0; i < 4; ++i) {
++		memset(drain, 0, sizeof drain);
++		if (touch_read(ST_ADDR, ST_READ_ALL_EVENT, false, drain, sizeof drain) ||
++		    drain[0] == ST_EV_NO_EVENT) {
++			break;
++		}
++	}
++	int ce = touch_msg(ST_ADDR, (const uint8_t[]){ST_CLEAR_EVENTS}, 1, NULL, 0, false);
++	touch_wait(20);
++	int se = touch_msg(ST_ADDR, (const uint8_t[]){ST_MT_SENSE_ON}, 1, NULL, 0, false);
++	touch_wait(30);
++	int st_err = touch_read(ST_ADDR, ST_READ_STATUS, false, status, sizeof status);
++	printf("SWEET TOUCH: ST FTS clear=%d sense-on=%d status=%d/%#x\n",
++	    ce, se, st_err, st_err ? 0 : status[0]);
++	st.probing = false;
++	st.kind = TOUCH_ST;
++	return true;
++}
++
++/* One READ_ALL_EVENT read carries a run of 8-byte events, oldest first. */
++static int
++touch_st(void)
++{
++	uint8_t buf[ST_EVENT_SIZE * ST_EVENTS_PER_READ];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t seen = 0, up = 0;
++
++	for (unsigned pass = 0; pass < 4; ++pass) {
++		memset(buf, 0, sizeof buf);
++		int err = touch_read(ST_ADDR, ST_READ_ALL_EVENT, false, buf, sizeof buf);
++		if (err) {
++			return err;
++		}
++		bool full = true;
++		for (unsigned i = 0; i < ST_EVENTS_PER_READ; ++i) {
++			const uint8_t *e = buf + ST_EVENT_SIZE * i;
++			unsigned ev = e[0], id = ev & 0x0fu, slot = ev >> 4;
++			if (ev == ST_EV_NO_EVENT || ev == ST_EV_DEBUG) {
++				full = false;
++				break;
++			}
++			if (id != ST_EV_ENTER && id != ST_EV_MOTION && id != ST_EV_LEAVE) {
++				continue;                /* key/hover/error: not a contact */
++			}
++			if (slot >= TOUCH_MAX) {
++				continue;
++			}
++			if (id == ST_EV_LEAVE) {
++				up |= 1u << slot;
++				continue;
++			}
++			unsigned px = e[1] | ((unsigned)(e[2] & 0x0fu) << 8);
++			unsigned py = (e[2] >> 4) | ((unsigned)e[3] << 4);
++			if (px >= tb->w || py >= tb->h) {
++				continue;                /* stylus/glove coordinate scaling */
++			}
++			x[slot] = (int)px;
++			y[slot] = (int)py;
++			seen |= 1u << slot;
++		}
++		if (!full) {
++			break;
++		}
++	}
++	uint32_t mask = (st.active | seen) & ~up;
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		if ((mask & (1u << i)) && !(seen & (1u << i))) {
++			x[i] = st.x[i];        /* still down, no new sample in this read */
++			y[i] = st.y[i];
++		}
++	}
++	if (mask == st.active && !seen && !up) {
++		return 0;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
+ static bool
+ touch_se_init(void)
+ {
+@@ -1071,7 +1239,7 @@ touch_thread(void *arg, wait_result_t result)
+ 		if (!st.bitbang && (!touch_clocks() || !touch_se_init())) {
+ 			goto out;
+ 		}
+-		if (!touch_beryllium_start()) {
++		if (!(sweet_board_dipper() ? touch_dipper_start() : touch_beryllium_start())) {
+ 			goto out;
+ 		}
+ 		goto selected;
+@@ -1121,6 +1289,7 @@ touch_thread(void *arg, wait_result_t result)
+ selected:
+ 	printf("SWEET TOUCH: selected %s, %ux%u, poll=%ums i2c-half=%uus irq-hint=%d\n",
+ 	    st.kind == TOUCH_NVT ? "NT36672A" : st.kind == TOUCH_FT8719 ? "Focaltech FT8719" :
++	    st.kind == TOUCH_ST ? "ST FingerTipS" :
+ 	    st.kind == TOUCH_GOODIX ? "GT9896 Yellowstone" : "Focaltech 54:52",
+ 	    tb->w, tb->h, touch_poll_ms, bb_half_us, st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
+@@ -1144,7 +1313,7 @@ selected:
+ 		bool periodic = st.kind == TOUCH_FT8719 ? (++ticks % 50u) == 0 :
+ 		    (st.kind != TOUCH_NVT && (++ticks % 10u) == 0);
+ 		/* slow bit-banged readers: IRQ edge or finger down only */
+-		bool paced = st.kind == TOUCH_NVT || st.kind == TOUCH_FT8719;
++		bool paced = st.kind == TOUCH_NVT || st.kind == TOUCH_FT8719 || st.kind == TOUCH_ST;
+ 		/*
+ 		 * While a finger is down read on every IRQ edge (a new frame) and at
+ 		 * least every ~8 ms, so a missed edge cannot leave a stuck contact;
+@@ -1159,7 +1328,8 @@ selected:
+ 			touch_trace_why = pending ? 'e' : 'a';
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
+ 			    st.kind == TOUCH_NVT ? touch_novatek() :
+-			    st.kind == TOUCH_FT8719 ? touch_ft8719() : touch_focaltech();
++			    st.kind == TOUCH_FT8719 ? touch_ft8719() :
++			    st.kind == TOUCH_ST ? touch_st() : touch_focaltech();
+ 			if (err) {
+ 				/* At most one line a minute: bad frames are frequent and harmless */
+ 				static uint64_t last_log;
+@@ -1199,7 +1369,10 @@ sweet_touch_init(void)
+ 		return;
+ 	}
+ 	st.started = true;
+-	if (sweet_board_beryllium()) {
++	if (sweet_board_dipper()) {
++		tb = &touch_dipper;
++		st.irq_hint = 1;
++	} else if (sweet_board_beryllium()) {
+ 		tb = &touch_beryllium;
+ 		st.irq_hint = 1; /* bit-banged reads are slow: only on IRQ edges or while touched */
+ 	}

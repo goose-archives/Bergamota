@@ -49,6 +49,11 @@ int pmic_pon_reason(void);
 int pmic_wled_get(uint16_t v[2]);
 int pmic_wled_set(const uint16_t v[2]);	/* 0 = written, latched and read back, -1 = not (originals restored) */
 int pmic_wled_enabled(void);		/* MOD_EN bit 7 */
+/* MOD_EN bit 7 as read at start (diag); set to 1 if it was clear. 0 = enabled. */
+int pmic_wled_enable(void);
+/* Light the backlight if the PMIC has it at zero. 0 = on, -1 = refused/failed. */
+int pmic_wled_watchdog(void);
+void pmic_wled_stats(unsigned *rescues, unsigned *fails, int *mod_was_off);
 
 /* SMB2 charger (SID 2): read any readable register (CHGR 0x10, USBIN 0x13, MISC 0x16, FG 0x40/0x41). */
 int pmic_chg_read(unsigned addr, uint8_t *v);

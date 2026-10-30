@@ -18,6 +18,7 @@
 #include "usb_power.h"
 #include "ufs.h"
 #include "fdt.h"
+#include "pmic.h"
 
 #define RESTART_BOOTLOADER	0x77665500U
 
@@ -383,6 +384,10 @@ void enxerto_main(uint64_t dtb)
 	 * Re-checked from the fastboot / charging loops, handed back to the kernel in loader_boot_payload.
 	 */
 	enxerto_charger_init(dtb);
+#ifdef BOARD_DIPPER
+	/* ABL drops the WLED module at the hand-off; light the panel before the first boot frame. */
+	(void)pmic_wled_watchdog();
+#endif
 
 	/*
 	 * Off-mode charging (docs/BERGAMOTA_CHARGE.md): ABL's charger path adds androidboot.mode=charger.

@@ -9,6 +9,7 @@
 #include <string.h>
 #include "blake2b.h"
 #include "fastboot.h"
+#include "board.h"
 #include "sparse.h"
 #include "storage.h"
 
@@ -1253,7 +1254,7 @@ int main(void)
 	fb = run_session(&r);
 	CHECK(r == FB_R_EOF);
 	CHECK(resp_is(0, "OKAY0.4"));
-	CHECK(resp_is(1, "OKAYberyllium"));
+	CHECK(resp_is(1, "OKAY" BOARD_NAME));
 	CHECK(resp_is(2, "OKAY0x100000"));
 	CHECK(resp_is(3, "OKAYno"));
 	CHECK(resp_is(4, "OKAY1"));
@@ -1270,7 +1271,7 @@ int main(void)
 	CHECK(resp_starts(0, "INFOversion: 0.4"));
 	int saw_prod = 0, saw_max = 0, saw_user = 0, saw_berg = 0;
 	for (int i = 0; i < n_resp; i++) {
-		saw_prod |= !strcmp(resp[i], "INFOproduct: beryllium");
+		saw_prod |= !strcmp(resp[i], "INFOproduct: " BOARD_NAME);
 		saw_max |= !strcmp(resp[i], "INFOmax-download-size: 0x100000");
 		saw_user |= !strcmp(resp[i], "INFOis-userspace: no");
 		saw_berg |= !strcmp(resp[i], "INFObergamota: 1");

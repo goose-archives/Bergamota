@@ -253,6 +253,8 @@ static int write_allowed(unsigned sid, unsigned addr, unsigned len)
 	if (sid != SID_WLED)
 		return 0;
 	switch (addr) {
+	case 0xd846:	/* MOD_EN: only bit 7 (module enable) is ever added, see pmic_wled_enable() */
+		return len == 1;
 	case 0xd947:	/* sink SYNC */
 		return len == 1;
 	case 0xd957:	/* string 0 / 1 brightness, 16 bit */
@@ -347,4 +349,57 @@ int pmic_wled_set(const uint16_t v[2])
 	}
 	(void)wled_put(old);	/* best effort back to what was there */
 	return -1;
+}
+
+/*
+ * Dipper: ABL leaves the splash on the panel but can turn the WLED module/backlight off a couple of
+ * seconds after the hand-off (observed on the MI 8: the Bergamota screen is visible, then the panel
+ * goes black). Bring the module up and, if the brightness is zero, light both strings; the idle loop
+ * repeats this so a late ABL/PMIC fade does not win. Beryllium never needs it, because ABL leaves the
+ * backlight at its splash level.
+ */
+static unsigned wled_rescue_n, wled_fail_n;
+static int wled_mod_was_off;
+
+int pmic_wled_enable(void)
+{
+	uint8_t m;
+
+	if (spmi_read(SID_WLED, WLED_MOD_EN, &m))
+		return -1;
+	if (m & 0x80)
+		return 0;
+	wled_mod_was_off = 1;
+	if (spmi_write(WLED_MOD_EN, (uint32_t)m | 0x80, 1))
+		return -1;
+	udelay(1000);
+	if (spmi_read(SID_WLED, WLED_MOD_EN, &m) || !(m & 0x80))
+		return -1;
+	return 0;
+}
+
+int pmic_wled_watchdog(void)
+{
+	uint16_t v[2], on[2];
+
+	if (pmic_wled_enable() || pmic_wled_get(v)) {
+		wled_fail_n++;
+		return -1;
+	}
+	if ((v[0] & 0xfff) || (v[1] & 0xfff))
+		return 0;
+	on[0] = on[1] = 0x7ff;
+	if (pmic_wled_set(on)) {
+		wled_fail_n++;
+		return -1;
+	}
+	wled_rescue_n++;
+	return 0;
+}
+
+void pmic_wled_stats(unsigned *rescues, unsigned *fails, int *mod_was_off)
+{
+	*rescues = wled_rescue_n;
+	*fails = wled_fail_n;
+	*mod_was_off = wled_mod_was_off;
 }

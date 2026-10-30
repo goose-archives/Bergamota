@@ -5,9 +5,10 @@
  */
 #include "fastboot.h"
 #include "sparse.h"
+#include "board.h"
 
 #ifndef FB_PRODUCT
-#define FB_PRODUCT	"beryllium"
+#define FB_PRODUCT	BOARD_NAME
 #endif
 #define FB_VERSION_BL	"bergamota-2"
 #define FB_SERIAL	"bergamota0001"
@@ -102,7 +103,7 @@ static void fb_drop_session(struct fb *fb)
  * Variable table as code: a static array of string pointers would need absolute
  * relocations, and the shim image runs wherever ABL put it (build.sh rejects ABS64).
  */
-#define FB_NVARS 15
+#define FB_NVARS 16
 #define FB_VBUF 48	/* value buffer of fb_getvar */
 
 static const char *fb_var(struct fb *fb, unsigned i, const char **name, char *buf)
@@ -133,6 +134,13 @@ static const char *fb_var(struct fb *fb, unsigned i, const char **name, char *bu
 		if (!fb->p->charger)
 			return "unavailable";
 		fb->p->charger(fb->p->ctx, i == 14, buf, FB_VBUF);
+		return buf[0] ? buf : "unavailable";
+	case 15:
+		*name = "bergamota-wled";
+		buf[0] = 0;
+		if (!fb->p->wled)
+			return "unavailable";
+		fb->p->wled(fb->p->ctx, buf, FB_VBUF);
 		return buf[0] ? buf : "unavailable";
 	}
 	return 0;

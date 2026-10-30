@@ -25,6 +25,7 @@
 #include "fdt.h"
 #include "loader.h"
 #include "mmu.h"
+#include "pmic.h"
 #include "storage.h"
 #include "ufs.h"
 #include "usb_dwc3.h"
@@ -375,6 +376,11 @@ static void ui_tick(void)
 		return;
 	ui_last_ms = t;
 	enxerto_charger_tick(0);	/* re-plug / APSD / temperature re-check, at most every 5 s */
+#ifdef BOARD_DIPPER
+	/* MI 8: ABL can drop the WLED backlight a couple of seconds after the hand-off. */
+	(void)pmic_init();
+	(void)pmic_wled_watchdog();
+#endif
 	ui_update();
 }
 
@@ -388,6 +394,31 @@ static void p_charger(void *ctx, int raw, char *buf, unsigned n)
 		enxerto_charger_raw(buf, n);
 	else
 		enxerto_charger_status(buf, n);
+}
+
+static void p_wled(void *ctx, char *buf, unsigned n)
+{
+	struct sb b = { buf, 0, n };
+	uint16_t v[2] = { 0, 0 };
+	unsigned rescues = 0, fails = 0;
+	int mod_off = 0;
+
+	(void)ctx;
+	buf[0] = 0;
+	(void)pmic_init();
+	pmic_wled_stats(&rescues, &fails, &mod_off);
+	sb_str(&b, pmic_wled_enabled() ? "on " : "off ");
+	if (pmic_wled_get(v)) {
+		sb_str(&b, "read-fail");
+	} else {
+		sb_hex(&b, v[0] & 0xfff);
+		sb_str(&b, "/");
+		sb_hex(&b, v[1] & 0xfff);
+	}
+	sb_str(&b, " r"); sb_u(&b, rescues);
+	sb_str(&b, " f"); sb_u(&b, fails);
+	if (mod_off)
+		sb_str(&b, " mod");
 }
 
 static int t_recv_cmd(void *ctx, char *buf, unsigned max)
@@ -472,6 +503,10 @@ static void p_boot(void *ctx, const uint8_t *img, uint64_t len)
 		boot_failed(why);
 	fbui_status("BOOTING PAYLOAD", "stopping USB, handing over", 1000, TEXT);
 	con_str("BOOT", "downloaded image, stopping USB");
+#ifdef BOARD_DIPPER
+	(void)pmic_init();
+	(void)pmic_wled_watchdog();
+#endif
 	usb_dwc3_stop();
 	why = loader_boot_payload(lo, hi, 1);
 	boot_failed(why);
@@ -805,6 +840,11 @@ const char *bergamota_fastboot(uintptr_t dtb)
 	static struct fb fb;
 	static struct fb_transport tr;
 	static struct fb_platform pl;
+#ifdef BOARD_DIPPER
+	/* ABL clears the WLED module right before the hand-off: light it before the first frame. */
+	(void)pmic_init();
+	(void)pmic_wled_watchdog();
+#endif
 	fbui_init(entry_why);
 	fbui_status("STARTING", "", FBUI_NOBAR, LABEL);
 	con_str("ENXERTO", "Bergamota fastboot " BOARD_NAME);
@@ -848,6 +888,7 @@ const char *bergamota_fastboot(uintptr_t dtb)
 	pl.gpt_info = p_gpt_info;
 	pl.usb_speed = p_usb_speed;
 	pl.charger = p_charger;
+	pl.wled = p_wled;
 	fb_init(&fb, &tr, &pl);
 	g_fb = &fb;
 	ui_last_ms = ms_now();

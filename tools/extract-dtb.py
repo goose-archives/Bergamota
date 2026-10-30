@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Extract the stock device tree(s) from an Android boot.img and pick the one for your phone.
 
-  extract-dtb.py BOOT.img OUTDIR [--live LIVE.dtb] [--pick N]
+  extract-dtb.py BOOT.img OUTDIR [--live LIVE.dtb] [--pick N] [--all]
 
 Works for boot.img header v0-v2:
   * v2 (e.g. Redmi Note 10 Pro `sweet`): the DTB has its own section in the header.
@@ -16,6 +16,8 @@ and board-id match the SoC and board; use the same one:
                       `adb pull /sys/firmware/fdt live.dtb` (OrangeFox/TWRP, adb root). The blob
                       with the same msm-id + board-id (and model, if several match) is selected.
   * --pick N          choose blob N by hand.
+  * --all             write every blob, concatenated, as OUTDIR/dtb (what the stock
+                      Image.gz-dtb carries; ABL then picks the matching one itself).
 The selected blob is also written as OUTDIR/dtb, the path Enxerto's build.sh expects
 (DTB=../dtb/<board>/dtb). For the Poco F1 the right one is "Beryllium MP v2.1"
 (msm-id <0x141 0x20001>, board-id <0x45 0>).
@@ -106,6 +108,7 @@ def main():
     ap.add_argument('boot'); ap.add_argument('out')
     ap.add_argument('--live', help="the phone's running FDT (adb pull /sys/firmware/fdt)")
     ap.add_argument('--pick', type=int, help='index of the blob to use')
+    ap.add_argument('--all', action='store_true', help='write all blobs concatenated as OUTDIR/dtb (ABL picks)')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     ver, kernel, dtb = boot_parts(open(a.boot, 'rb').read())
@@ -143,8 +146,13 @@ def main():
                 print('live tree matches %s; using the first (ABL picks the first match), override with --pick' % hits)
         else:
             print('live tree matches nothing; choose one with --pick')
+    if a.all:
+        open(os.path.join(a.out, 'dtb'), 'wb').write(b''.join(blobs))
+        print('\nall %d blobs concatenated -> %s (ABL selects by msm-id/board-id)' % (
+            len(blobs), os.path.join(a.out, 'dtb')))
+        return
     if pick is None:
-        print('\nno blob selected: rerun with --live LIVE.dtb or --pick N (OUTDIR/rom-N.dtb are written)')
+        print('\nno blob selected: rerun with --live LIVE.dtb, --pick N or --all (OUTDIR/rom-N.dtb are written)')
         return
     open(os.path.join(a.out, 'dtb'), 'wb').write(blobs[pick])
     print('\nselected rom-%d (%s) -> %s' % (pick, descs[pick][0], os.path.join(a.out, 'dtb')))

@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium|dipper] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
 """
 import hashlib, os, struct, sys
 
@@ -69,6 +69,21 @@ BOARDS = {
         ],
         # /arm-io/bluetooth for bluetoothd/BlueTool (docs/BT_IOS_TRANSPORT.md 3.2). Sweet has no
         # Bluetooth driver: the node is beryllium only.
+        bluetooth=True),
+    'dipper': dict(
+        # reserved-memory cont_splash_region@9d400000, Samsung AMOLED 1080x2248 (Mi 8)
+        fb=(0x9d400000, 0x2400000), fb_wh=(1080, 2248),
+        # 'xiaomi,sweet' stays: SweetPlatformExpert matches it
+        compat=['xiaomi,dipper', 'xiaomi,sweet', 'qcom,sdm845'],
+        # 0-3 Kryo 385 Silver (A55), 4-7 Gold (A75), as on beryllium
+        cpu_compat='qcom,kryo385', big_from=4, freqs=(1766400000, 2803200000),
+        # Same DDR map as beryllium: free between cont_splash (ends 0x9f800000)
+        # and ramdump_fb_region@af000000. --highmem: same 6 GB upper bank.
+        mem=(0x9f800000, 0x0f800000),
+        chosen_extra=[
+            ('mac-address-wifi0', bytes([0x02, 0x00, 0x5e, 0x77, 0xe0, 0x01])),
+            ('mac-address-bluetooth0', BT_MAC),
+        ],
         bluetooth=True),
 }
 
@@ -165,8 +180,8 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
     fb_w, fb_h = b['fb_wh']
     if lowpool is not None:
         lp_base, lp_size = lowpool
-        if board != 'beryllium' or qemu:
-            raise SystemExit('--lowpool: Poco F1 only (--board beryllium, not --qemu)')
+        if board not in ('beryllium', 'dipper') or qemu:
+            raise SystemExit('--lowpool: Poco F1/Mi 8 only (--board beryllium|dipper, not --qemu)')
         if lp_base < LOWPOOL_MIN or lp_base + lp_size > LOWPOOL_MAX or lp_base & 0x3fff or lp_size & 0x3fff:
             raise SystemExit(f'--lowpool {lp_base:#x}:{lp_size:#x}: must be 16K aligned inside {LOWPOOL_MIN:#x}..{LOWPOOL_MAX:#x}')
         if lp_base < phys_base + mem_size and phys_base < lp_base + lp_size:

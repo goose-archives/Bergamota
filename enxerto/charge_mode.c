@@ -140,7 +140,7 @@ static void backlight_init(void)
 	uint16_t w[2];
 
 	have_wled = 0;
-	if (pmic_rc || pmic_wled_get(w) || !pmic_wled_enabled())
+	if (pmic_rc || pmic_wled_get(w) || pmic_wled_enable() || !pmic_wled_enabled())
 		return;
 	have_wled = 1;
 	if (w[0] & 0xfff || w[1] & 0xfff) {

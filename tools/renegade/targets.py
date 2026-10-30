@@ -10,6 +10,10 @@ ios18  iOS 18.7.8 (22H352) for iPhone11,8 (iPhone XR, N841AP), booted with the i
 import os
 import sys
 
+# Hardware board profile (enxerto/build.sh BOARD=, tools/mkadt.py --board).
+# The iOS target is independent of it; the default ADT name follows the board.
+BOARD = os.environ.get('BOARD', 'beryllium')
+
 TARGETS = {
     'ios26': dict(
         device='iPhone12,1', version='26.6.2', build='23G90',
@@ -18,7 +22,7 @@ TARGETS = {
         work='research/ios26',
         board='N104',        # EventTimingProfiles/<board>.*.plist shipped in the root
         adt_target='N104',   # ADT target-type the kernel reports (mkadt --identity n104ap)
-        adt='enxerto/out/beryllium-n104-2x.adt'),
+        adt=f'enxerto/out/{BOARD}-n104-2x.adt'),
     'ios18': dict(
         device='iPhone11,8', version='18.7.8', build='22H352',
         dmgs=('094-31934-020.dmg.aea', '094-32062-020.dmg.aea', '094-32850-020.dmg'),
@@ -31,7 +35,7 @@ TARGETS = {
 NAME = os.environ.get('RENEGADE_TARGET', 'ios26')
 if NAME not in TARGETS:
     sys.exit(f'RENEGADE_TARGET={NAME}: unknown (have {", ".join(TARGETS)})')
-T = dict(TARGETS[NAME], name=NAME)
+T = dict(TARGETS[NAME], name=NAME, board=BOARD)
 T['ipsw_dir'] = os.path.join(T['work'], 'ipsw', f"{T['build']}__{T['device']}")
 T['root_img'] = os.path.join(T['work'], f"{NAME}-root-full.img")
 

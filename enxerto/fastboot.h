@@ -68,6 +68,8 @@ struct fb_platform {
 	const char *(*usb_speed)(void *ctx);
 	/* getvar bergamota-charger (raw=0) / bergamota-charger-raw (raw=1): at most 47 characters into buf; may be NULL */
 	void (*charger)(void *ctx, int raw, char *buf, unsigned n);
+	/* getvar bergamota-wled: backlight state/diagnostic counters, at most 47 characters; may be NULL */
+	void (*wled)(void *ctx, char *buf, unsigned n);
 };
 
 /* what a long command is doing, for the screen */

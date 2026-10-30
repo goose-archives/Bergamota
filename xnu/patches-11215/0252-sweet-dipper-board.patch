@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/sweet_board.h b/dev/sweet_board.h
+index 3d9c06a..07b438b 100644
+--- a/bsd/dev/sweet_board.h
++++ b/bsd/dev/sweet_board.h
+@@ -1,8 +1,9 @@
+ /*
+- * SWEET kernels run on two Xiaomi phones. The ADT root compatible
++ * SWEET kernels run on three Xiaomi phones. The ADT root compatible
+  * (tools/mkadt.py --board) names the board; everything else is common.
+  *   xiaomi,sweet      Redmi Note 10 Pro, SM7150 (default)
+  *   xiaomi,beryllium  Poco F1, SDM845
++ *   xiaomi,dipper     Xiaomi Mi 8, SDM845
+  */
+ #ifndef _SWEET_BOARD_H_
+ #define _SWEET_BOARD_H_
+@@ -66,12 +67,30 @@ sweet_board_is(const char *want)
+ 	return false;
+ }
+ 
++/*
++ * Every SDM845 path (PM8998/PMI8998, UFS, USB, A630 GPU, WLED backlight, RTC,
++ * cpufreq, charger) is shared by the Poco F1 and the Mi 8, so this predicate
++ * means "SDM845 phone": keep the historical name and let it cover dipper.
++ * Dipper-only differences (the touch controller) use sweet_board_dipper().
++ */
+ static inline bool
+ sweet_board_beryllium(void)
+ {
+ 	static int cached = -1;
+ 	if (cached < 0) {
+-		cached = sweet_board_is("xiaomi,beryllium") ? 1 : 0;
++		cached = (sweet_board_is("xiaomi,beryllium") ||
++		    sweet_board_is("xiaomi,dipper")) ? 1 : 0;
++	}
++	return cached == 1;
++}
++
++/* Xiaomi Mi 8 (SDM845, ST FTS touch at 0x49, 1080x2248 AMOLED). */
++static inline bool
++sweet_board_dipper(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		cached = sweet_board_is("xiaomi,dipper") ? 1 : 0;
+ 	}
+ 	return cached == 1;
+ }

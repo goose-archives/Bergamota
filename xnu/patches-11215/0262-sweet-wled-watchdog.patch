@@ -1,0 +1,141 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -111,6 +111,7 @@
+ class AppleCLCD;
+ static AppleCLCD *sweet_fb_shot_fb;             /* the framebuffer kern.sweet_fb_shot reads (patch 0224) */
+ static int sweet_fb_keepon;                     /* 0260: sweetfb_keepon, ignore display-off requests */
++static int sweet_wled_read16(unsigned string, uint16_t *out);   /* the WLED string brightness (0262 watchdog) */
+ extern "C" unsigned char iso_font[256 * 16];    /* osfmk/console/iso_font.c: the 8x16 console font */
+ extern "C" void sweet_gpu_hud_state(unsigned *mhz, unsigned *level, unsigned *busy_pct, int *gov, int *state); /* bsd/dev/sweet_a630.c */
+ extern "C" void sweet_cpufreq_hud_mhz(unsigned *a55_mhz, unsigned *a75_mhz);    /* bsd/dev/sweet_cpufreq.c */
+@@ -475,6 +476,7 @@
+ 	void          blInit(void);
+ 	bool          blStep(int dir);
+ 	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
++	void          blWatchdog(void); /* 0262: the WLED module/brightness can be dropped after the handoff */
+ 	bool          fBlOffFailed;     /* 0242: this power-off could not darken the WLED: black frame instead, for this off only */
+ 	/* 0243: brightness iOS asked for through AppleARMBacklight (0..4095), and the one written; applied on the vsync timer */
+ 	uint32_t      fBlReq, fBlReqApplied;
+@@ -501,6 +503,9 @@
+ 	uint32_t      fTestTick;      /* vsync ticks since the last repaint */
+ 	uint32_t      fTestBlTries;   /* backlight re-asserts (bounded) */
+ 	uint32_t      fTestLogged;    /* the MDP scan address was logged once */
++	/* 0262: PMI8998 WLED watchdog (the module can be dropped after the bootloader hands over) */
++	uint32_t      fBlWatchTick;   /* vsync ticks since the last WLED check */
++	uint32_t      fBlFixLogged;   /* rescues logged (the first few only) */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -655,6 +660,8 @@
+ 	fPipe = -1;
+ 	fSmmuA = fSmmuB = -2;
+ 	fZcCleanMode = 1;
++	fBlWatchTick = 0;
++	fBlFixLogged = 0;
+ 	{
+ 		uint32_t secs = 10;
+ 		PE_parse_boot_argn("sweetfb_statlog", &secs, sizeof(secs));
+@@ -968,6 +975,9 @@
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	fb->fSt.ticks++;
++	if ((++fb->fBlWatchTick % 10) == 0) {
++		fb->blWatchdog();       /* 0262: ~3 times a second, before anything else touches the panel */
++	}
+ 	if (fb->fTestUntil != 0) {
+ 		if (now < fb->fTestUntil) {
+ 			/* 0261: hold the bars: repaint twice a second, keep the WLED lit (the panel is AMOLED) */
+@@ -978,6 +988,16 @@
+ 					(void)fb->blSet(true);
+ 				}
+ 			}
++			if ((fb->fTestTick % 300) == 0) {
++				/* 0262: every ~10 s, what the panel path looks like from in here */
++				uint16_t l0 = 0xffff, l1 = 0xffff;
++				(void)sweet_wled_read16(0, &l0);
++				(void)sweet_wled_read16(1, &l1);
++				IOLog("SWEET FBTEST: ~%u s: wled 0x%04x/0x%04x (want 0x%04x), blpos %u ok %d, poweroff %d, front %u hw %d, swaps %llu, ticks %llu\n",
++				    fb->fTestTick / 30, l0, l1, fb->fBlRaw[0], fb->fBlPos, fb->fBlOK ? 1 : 0,
++				    fb->fPowerOff ? 1 : 0, fb->fFront, fb->fHwOn ? 1 : 0,
++				    fb->fSt.swaps, fb->fSt.ticks);
++			}
+ 			sender->setTimeoutUS(fb->fVsyncUS);
+ 			return;
+ 		}
+@@ -2752,6 +2772,55 @@
+ 	return false;
+ }
+ 
++/*
++ * 0262: the PMI8998 WLED module can be switched off a couple of seconds after the bootloader hands over (dipper:
++ * the boot screen is visible, then the panel goes black even though the MDP keeps scanning). Enxerto kicks the
++ * module every 250 ms while it runs (pmic_wled_watchdog); once xnu starts nobody does, so do the same here once a
++ * second: if the module enable bit went away, put it back; if we think the backlight is on and the strings read
++ * zero, light them again. A deliberate power off (fBlPos == 0, iOS asked) is left alone.
++ */
++void
++AppleCLCD::blWatchdog(void)
++{
++	uint8_t mod = 0;
++	uint16_t lvl[2] = { 0xffff, 0xffff };
++	bool modBack = false, dark = false, wanted;
++
++	if (sweet_spmi_read(SWEET_WLED_SID, SWEET_WLED_MOD_EN, &mod) == 0 && !(mod & 0x80)) {
++		uint8_t on = (uint8_t)(mod | 0x80);
++		modBack = sweet_spmi_write(SWEET_WLED_SID, SWEET_WLED_MOD_EN, &on, 1) == 0;
++	}
++	if (sweet_wled_read16(0, &lvl[0]) == 0 && sweet_wled_read16(1, &lvl[1]) == 0) {
++		dark = ((lvl[0] | lvl[1]) & 0xfff) == 0;
++	}
++	if (!modBack && !dark) {
++		return;
++	}
++	wanted = (fTestUntil != 0 && mach_absolute_time() < fTestUntil) ||
++	    (fBlOK && fBlPos == SWEET_FB_BL_STEPS);
++	if (!wanted) {
++		return;                 /* iOS asked for the panel off (or it never came on): do not fight it */
++	}
++	if (fBlRaw[0] == 0 || fBlRaw[1] == 0) {
++		fBlRaw[0] = fBlRaw[1] = 0x7ff;  /* nothing known: a level the strings can show */
++	}
++	/* the module is back or the strings read zero: write the level again and latch it (blSet without the logs) */
++	for (unsigned n = 0; n < SWEET_WLED_STRINGS; n++) {
++		uint8_t d[2] = { (uint8_t)fBlRaw[n], (uint8_t)(fBlRaw[n] >> 8) };
++		(void)sweet_spmi_write(SWEET_WLED_SID, SWEET_WLED_BRIGHT(n), d, 2);
++	}
++	uint8_t clr = 0, set = SWEET_WLED_SYNC_MASK;
++	(void)sweet_spmi_write(SWEET_WLED_SID, SWEET_WLED_SYNC, &clr, 1);
++	(void)sweet_spmi_write(SWEET_WLED_SID, SWEET_WLED_SYNC, &set, 1);
++	fBlPos = SWEET_FB_BL_STEPS;
++	fBlOK = true;
++	if (fBlFixLogged < 8) {
++		fBlFixLogged++;
++		IOLog("SWEET FB: WLED was off after the handoff (MOD_EN 0x%02x%s, strings 0x%04x/0x%04x%s): back on at 0x%04x\n",
++		    mod, modBack ? " restored" : "", lvl[0], lvl[1], dark ? " relit" : "", fBlRaw[0]);
++	}
++}
++
+ bool
+ AppleCLCD::blStep(int dir)
+ {
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -203,7 +203,9 @@
+  *   0x47        WLED3_SINK_REG_SYNC (one byte)
+  *   0x57 0x67   WLED4_SINK_REG_BRIGHT(0/1), 16-bit little endian (1 or 2 bytes)
+  *   0x58 0x68   their high bytes (one byte)
+- * Nothing in the control module (0xd8: MOD_EN, OVP, boost) is writable.
++ *   0x46        WLED4_MOD_EN of the control module, one byte (0262): the dipper bug below. Enxerto only ever
++ *               adds bit 7 (module enable); xnu does the same from its once-a-second WLED watchdog, nothing else
++ *               of the control module (OVP, boost, ...) is writable.
+  * SID 0: PM8998 PON_SOFT_RB_SPARE (0x88f, one byte) only, the reboot reason
+  * of qcom-pon.c (written by sweet_reboot.c, read-modify-write).
+  * SID 2: PMI8998 SMB2 charger, single bytes, only after sweet_charger.c
+@@ -258,6 +260,7 @@
+ 	case 0xd947u:
+ 	case 0xd958u:
+ 	case 0xd968u:
++	case 0xd846u:   /* 0262: WLED MOD_EN, bit 7 only (dipper watchdog) */
+ 		return len == 1;
+ 	case 0xd957u:
+ 	case 0xd967u:

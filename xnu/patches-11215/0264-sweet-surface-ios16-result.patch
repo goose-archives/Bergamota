@@ -1,0 +1,119 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -77,6 +77,9 @@
+ };
+ 
+ #define SWEET_SURFACE_RESULT_SIZE       0xc68   /* iOS 18: 0x88 header + 20 planes * 0x98 */
++#define SWEET_SURFACE_RESULT_16_SIZE    0xa68   /* iOS 16: 0x68 header + 20 planes * 0x80 */
++#define SWEET_SURFACE_RESULT_16_PLANE   0x80
++#define SWEET_SURFACE_RESULT_16_PLANES  20
+ #define SWEET_SURFACE_MAX_ID            4096
+ #define SWEET_SURFACE_MAX_DIM           16384
+ #define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
+@@ -977,6 +980,17 @@
+  *                    +0x30 bytesPerElement u16, +0x32 elementWidth u8, +0x33 elementHeight u8, +0x6c u8 compressed flag
+  * The iOS 16 layout put 32-bit fields at 0x1c.., so the client read width/height/rowbytes as garbage and CoreUI wrote
+  * past the surface (SpringBoard SIGSEGV in vImageDeepmap2Decode, destination = base + bytesPerElement).
++ *
++ * iOS 16.x does not use that layout at all: IOSurfaceClientCreateChild passes a 0xa68-byte output struct and copies
++ * 0x68 + max(planeCount,1) * 0x80 bytes of it to IOSurfaceClient + 0x68, which is where every client getter reads
++ * (IOSurfaceClientGetWidth: +0x88, GetHeight: +0x8c, GetBytesPerRow: +0x90, GetPixelFormat: +0x98, GetPlaneCount:
++ * +0xa0, planes at +0xd0 every 0x80). Its fields are the same fields in the same order, only 32-bit and 0x20 bytes
++ * earlier: kernel result 0x00 base, 0x08 state page, 0x10 timestamps, 0x18 id, 0x1c allocSize, 0x20 width,
++ * 0x24 height, 0x28 bytesPerRow, 0x2c offset, 0x30 pixelFormat, 0x38 planeCount, 0x40 bytesPerElement u16,
++ * 0x42 elementWidth, 0x43 elementHeight, 0x44 cacheMode, 0x50 parentID, 0x60 protectionOptions, planes at
++ * 0x68 + i * 0x80: +0 width, +4 height, +0xc offset, +0x10 bytesPerRow, +0x14 size, +0x18 bytesPerElement,
++ * +0x1a elementWidth, +0x1b elementHeight. Returning the iOS 18 record to it made the copy fail with
++ * kIOReturnNoSpace (0xe00002db), so CoreAnimation had no surfaces and presented NULL layers.
+  */
+ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+@@ -1013,6 +1027,53 @@
+ 	}
+ }
+ 
++/* The same record as iOS 16.x expects it (0xa68 bytes, see above). */
++static void
++sweet_surface_fill_result_16(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
++{
++	bzero(out, SWEET_SURFACE_RESULT_16_SIZE);
++	put64(out, 0x00, ref->data->getAddress() + s->wrapDelta);
++	put64(out, 0x08, ref->state->getAddress());
++	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
++	put32(out, 0x18, s->id);
++	put32(out, 0x1c, s->allocSize);
++	put32(out, 0x20, s->width);
++	put32(out, 0x24, s->height);
++	put32(out, 0x28, s->bytesPerRow);
++	put32(out, 0x2c, s->offset);
++	put32(out, 0x30, s->pixelFormat);
++	put32(out, 0x34, s->allocSize);
++	put32(out, 0x38, s->planeCount);
++	memcpy(out + 0x40, &s->bytesPerElement, 2);
++	out[0x42] = s->elementWidth;
++	out[0x43] = s->elementHeight;
++	put32(out, 0x44, s->cacheMode);
++	put32(out, 0x50, s->parentID);
++	put32(out, 0x54, 1);
++	for (uint32_t i = 0; i < s->planeCount && i < SWEET_SURFACE_RESULT_16_PLANES; i++) {
++		uint8_t *p = out + 0x68 + i * SWEET_SURFACE_RESULT_16_PLANE;
++		const struct sweet_surface_plane *pl = &s->planes[i];
++		put32(p, 0x00, pl->width);
++		put32(p, 0x04, pl->height);
++		put32(p, 0x0c, pl->offset);
++		put32(p, 0x10, pl->bytesPerRow);
++		put32(p, 0x14, pl->size);
++		memcpy(p + 0x18, &pl->bytesPerElement, 2);
++		p[0x1a] = pl->elementWidth;
++		p[0x1b] = pl->elementHeight;
++	}
++}
++
++/* How much room the caller left for the record (IOSurface.framework asks for 0xa68 on iOS 16, 0xc68 on iOS 18). */
++static uint32_t
++sweet_struct_out_capacity(IOExternalMethodArguments *args)
++{
++	if (args->structureOutputDescriptor != NULL) {
++		return (uint32_t)args->structureOutputDescriptor->getLength();
++	}
++	return args->structureOutputSize;
++}
++
+ static IOReturn
+ sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+ {
+@@ -1046,11 +1107,31 @@
+ 	if (out == NULL) {
+ 		ret = kIOReturnNoMemory;
+ 	} else {
+-		sweet_surface_fill_result(s, ref, out);
++		uint32_t cap = sweet_struct_out_capacity(args);
++		bool legacy = cap < SWEET_SURFACE_RESULT_SIZE;
++		uint32_t len = legacy ? SWEET_SURFACE_RESULT_16_SIZE : SWEET_SURFACE_RESULT_SIZE;
++		if (legacy) {
++			sweet_surface_fill_result_16(s, ref, out);
++		} else {
++			sweet_surface_fill_result(s, ref, out);
++		}
+ 		if (existing) {
+ 			put64(out, 0x00, ~0ULL);        /* "already yours": use the cached client */
+ 		}
+-		ret = sweet_struct_out(args, out, SWEET_SURFACE_RESULT_SIZE);
++		if (len > cap) {
++			len = cap;                      /* a short buffer takes a truncated record, never an error */
++		}
++		if (len < 0x68) {
++			ret = kIOReturnNoSpace;         /* not even the header fits */
++		} else {
++			ret = sweet_struct_out(args, out, len);
++		}
++		static uint32_t logged;
++		if (logged < 8) {
++			logged++;
++			IOLog("SWEET SURF: result cap %u -> %s layout %u bytes, ret 0x%x\n", cap,
++			    legacy ? "ios16" : "ios18", len, ret);
++		}
+ 		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);
+ 	}
+ 	if (ret != kIOReturnSuccess && !existing) {

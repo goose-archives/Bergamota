@@ -1,0 +1,195 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -111,6 +111,22 @@
+ class AppleCLCD;
+ static AppleCLCD *sweet_fb_shot_fb;             /* the framebuffer kern.sweet_fb_shot reads (patch 0224) */
+ static int sweet_fb_keepon;                     /* 0260: sweetfb_keepon, ignore display-off requests */
++/*
++ * PMI8998 WLED backlight (SID 3; reg = <0xd800>, <0xd900> in pmi8998.dtsi;
++ * Linux drivers/video/backlight/qcom-wled.c, WLED4): sink base 0xd900,
++ * WLED4_SINK_REG_BRIGHT(n) = +0x57 + 0x10 * n (16 bit little endian, max
++ * 0xfff), WLED3_SINK_REG_SYNC +0x47 (clear, then set the string mask to
++ * latch a new brightness). Poco F1 has two strings (qcom,num-strings = 2).
++ * The control module (0xd846 MOD_EN bit 7) is only ever added back by the
++ * 0262 watchdog; the fade itself only moves the brightness.
++ */
++#define SWEET_WLED_SID          3
++#define SWEET_WLED_SINK         0xd900u
++#define SWEET_WLED_MOD_EN       0xd846u
++#define SWEET_WLED_SYNC         (SWEET_WLED_SINK + 0x47u)
++#define SWEET_WLED_BRIGHT(n)    (SWEET_WLED_SINK + 0x57u + 0x10u * (n))
++#define SWEET_WLED_STRINGS      2
++#define SWEET_WLED_SYNC_MASK    0x0fu   /* GENMASK(max_string_count - 1, 0), WLED4: 4 */
+ static int sweet_wled_read16(unsigned string, uint16_t *out);   /* the WLED string brightness (0262 watchdog) */
+ extern "C" unsigned char iso_font[256 * 16];    /* osfmk/console/iso_font.c: the 8x16 console font */
+ extern "C" void sweet_gpu_hud_state(unsigned *mhz, unsigned *level, unsigned *busy_pct, int *gov, int *state); /* bsd/dev/sweet_a630.c */
+@@ -503,6 +519,10 @@
+ 	uint32_t      fTestTick;      /* vsync ticks since the last repaint */
+ 	uint32_t      fTestBlTries;   /* backlight re-asserts (bounded) */
+ 	uint32_t      fTestLogged;    /* the MDP scan address was logged once */
++	uint32_t      fTestDumpMask;  /* 0263: which of the WLED register dumps are done */
++	uint32_t      fTestFrames;    /* 0263: MDP INTF1 frame count at the last periodic line */
++	void          testLog(void);  /* 0263: one line a second, what the panel path looks like */
++	void          testDumpRegs(const char *why);    /* 0263: the whole WLED control/sink blocks */
+ 	/* 0262: PMI8998 WLED watchdog (the module can be dropped after the bootloader hands over) */
+ 	uint32_t      fBlWatchTick;   /* vsync ticks since the last WLED check */
+ 	uint32_t      fBlFixLogged;   /* rescues logged (the first few only) */
+@@ -884,9 +904,11 @@
+ 		uint32_t secs = 0;
+ 		PE_parse_boot_argn("sweetfbtest", &secs, sizeof(secs));
+ 		if (secs != 0) {
+-			clock_interval_to_deadline(secs * 1000, 1000, &fTestUntil);
++			clock_interval_to_deadline(secs, NSEC_PER_SEC, &fTestUntil);
+ 			fTestTick = 0;
+ 			fTestLogged = 0;
++			fTestDumpMask = 0;
++			fTestFrames = 0;
+ 			if (fFlip && (fFront != 0 || fHwOn)) {
+ 				scanTo(0);
+ 			}
+@@ -904,6 +926,7 @@
+ 			    secs, fWidth, fHeight, fPhys, fRowBytes, fBlOK ? 1 : 0,
+ 			    ((uint32_t *)fPixels)[0],
+ 			    ((uint32_t *)(fPixels + (uintptr_t)(fHeight / 2) * fRowBytes))[fWidth / 2]);
++			testDumpRegs("start");
+ 		}
+ 	}
+ 	return true;
+@@ -988,15 +1011,8 @@
+ 					(void)fb->blSet(true);
+ 				}
+ 			}
+-			if ((fb->fTestTick % 300) == 0) {
+-				/* 0262: every ~10 s, what the panel path looks like from in here */
+-				uint16_t l0 = 0xffff, l1 = 0xffff;
+-				(void)sweet_wled_read16(0, &l0);
+-				(void)sweet_wled_read16(1, &l1);
+-				IOLog("SWEET FBTEST: ~%u s: wled 0x%04x/0x%04x (want 0x%04x), blpos %u ok %d, poweroff %d, front %u hw %d, swaps %llu, ticks %llu\n",
+-				    fb->fTestTick / 30, l0, l1, fb->fBlRaw[0], fb->fBlPos, fb->fBlOK ? 1 : 0,
+-				    fb->fPowerOff ? 1 : 0, fb->fFront, fb->fHwOn ? 1 : 0,
+-				    fb->fSt.swaps, fb->fSt.ticks);
++			if ((fb->fTestTick % 30) == 0) {
++				fb->testLog();  /* 0263: once a second */
+ 			}
+ 			sender->setTimeoutUS(fb->fVsyncUS);
+ 			return;
+@@ -1964,6 +1980,73 @@
+ }
+ 
+ /*
++ * 0263: one line a second while sweetfbtest holds the panel: the WLED module and its strings, the backlight state
++ * xnu believes in, and the MDP pipe (scan address, stride, INTF1 frames drawn since the last line). The deadline of
++ * 0261 was wrong (clock_interval_to_deadline takes nanoseconds, the call passed milliseconds), so the bars were only
++ * held for a fraction of a second and the log of the moment they disappear did not exist. This is that log.
++ */
++void
++AppleCLCD::testLog(void)
++{
++	static const uint32_t marks[4] = { 90, 180, 360, 900 };      /* 3, 6, 12, 30 s at 30 Hz */
++	static const char *const names[4] = { "3 s", "6 s", "12 s", "30 s" };
++	uint8_t mod = 0, sync = 0;
++	uint16_t l0 = 0xffff, l1 = 0xffff;
++	uint32_t src = 0, stride = 0, frames = 0, drew = 0;
++
++	(void)sweet_spmi_read(SWEET_WLED_SID, SWEET_WLED_MOD_EN, &mod);
++	(void)sweet_spmi_read(SWEET_WLED_SID, SWEET_WLED_SYNC, &sync);
++	(void)sweet_wled_read16(0, &l0);
++	(void)sweet_wled_read16(1, &l1);
++	if (fMdp != 0) {
++		if (fPipe >= 0) {
++			volatile uint32_t *p = (volatile uint32_t *)(fMdp + sweet_mdp_pipes[fPipe].off);
++			src = p[SSPP_SRC0_ADDR / 4];
++			stride = p[SSPP_YSTRIDE0 / 4];
++		}
++		frames = mdp_rd(fMdp + SWEET_MDP_INTF1, 0xac);
++		drew = frames - fTestFrames;
++		fTestFrames = frames;
++	}
++	IOLog("SWEET FBTEST: t=%u s: mod 0x%02x sync 0x%02x wled 0x%04x/0x%04x want 0x%04x blpos %u ok %d pwr %d front %u hw %d mdp 0x%x/0x%x intf %u (+%u) swaps %llu\n",
++	    fTestTick / 30, mod, sync, l0, l1, fBlRaw[0], fBlPos, fBlOK ? 1 : 0, fPowerOff ? 1 : 0,
++	    fFront, fHwOn ? 1 : 0, src, stride, frames, drew, fSt.swaps);
++	for (uint32_t i = 0; i < 4; i++) {
++		if (fTestTick >= marks[i] && !(fTestDumpMask & (1u << i))) {
++			fTestDumpMask |= 1u << i;
++			testDumpRegs(names[i]);
++		}
++	}
++}
++
++/* 0263: the PMI8998 WLED control (0xd8) and sink (0xd9) blocks, 16 bytes a line; 0xff means the read failed. */
++void
++AppleCLCD::testDumpRegs(const char *why)
++{
++	static const char hex[] = "0123456789abcdef";
++
++	for (unsigned base = 0xd800; base <= 0xd900; base += 0x100) {
++		for (unsigned off = 0; off < 0x100; off += 16) {
++			char line[16 * 3 + 1];
++			uint32_t bad = 0;
++			for (unsigned i = 0; i < 16; i++) {
++				uint8_t v = 0;
++				if (sweet_spmi_read(SWEET_WLED_SID, base + off + i, &v) != 0) {
++					v = 0xff;
++					bad++;
++				}
++				line[i * 3 + 0] = hex[v >> 4];
++				line[i * 3 + 1] = hex[v & 0xf];
++				line[i * 3 + 2] = ' ';
++			}
++			line[16 * 3] = 0;
++			IOLog("SWEET FBTEST: wled %s t=%u 0x%03x: %s%s\n", why, fTestTick / 30, base + off, line,
++			    bad ? "(ff = read failed)" : "");
++		}
++	}
++}
++
++/*
+  * Clean (not invalidate) a CPU-written range to the point of coherency: the
+  * MDP reads DRAM. This build is __ARM_COHERENT_IO__, where the kernel's own
+  * flush_dcache64/clean_dcache64 are bare "dsb sy", so it is done by hand.
+@@ -2613,23 +2696,6 @@
+ 	return true;
+ }
+ 
+-/*
+- * PMI8998 WLED backlight (SID 3; reg = <0xd800>, <0xd900> in pmi8998.dtsi;
+- * Linux drivers/video/backlight/qcom-wled.c, WLED4): sink base 0xd900,
+- * WLED4_SINK_REG_BRIGHT(n) = +0x57 + 0x10 * n (16 bit little endian, max
+- * 0xfff), WLED3_SINK_REG_SYNC +0x47 (clear, then set the string mask to
+- * latch a new brightness). Poco F1 has two strings (qcom,num-strings = 2).
+- * The control module (0xd846 MOD_EN bit 7) is never written: the fade only
+- * moves the brightness and leaves the driver stage as ABL set it up.
+- */
+-#define SWEET_WLED_SID          3
+-#define SWEET_WLED_SINK         0xd900u
+-#define SWEET_WLED_MOD_EN       0xd846u
+-#define SWEET_WLED_SYNC         (SWEET_WLED_SINK + 0x47u)
+-#define SWEET_WLED_BRIGHT(n)    (SWEET_WLED_SINK + 0x57u + 0x10u * (n))
+-#define SWEET_WLED_STRINGS      2
+-#define SWEET_WLED_SYNC_MASK    0x0fu   /* GENMASK(max_string_count - 1, 0), WLED4: 4 */
+-
+ static int
+ sweet_wled_read16(unsigned string, uint16_t *out)
+ {
+@@ -2818,6 +2884,9 @@
+ 		fBlFixLogged++;
+ 		IOLog("SWEET FB: WLED was off after the handoff (MOD_EN 0x%02x%s, strings 0x%04x/0x%04x%s): back on at 0x%04x\n",
+ 		    mod, modBack ? " restored" : "", lvl[0], lvl[1], dark ? " relit" : "", fBlRaw[0]);
++		if (fTestUntil != 0) {
++			testDumpRegs("watchdog");   /* 0263: what the block looked like when it went away */
++		}
+ 	}
+ }
+ 
+@@ -3480,6 +3549,11 @@
+ 		}
+ 	}
+ 	if (!any) {
++		static unsigned blankLogged;
++		if (blankLogged < 4) {
++			blankLogged++;
++			IOLog("SWEET FB: layerless swap %u: nothing to compose, the panel is blanked\n", fCurSwapID);
++		}
+ 		bzero((void *)fDraw, (size_t)(fHw && fFlip ? (uint64_t)fHwStride * fLogicalH : (uint64_t)fRowBytes * fHeight));
+ 		fBarsMask |= (uint8_t)(1u << fDrawIdx);      /* its scaling bars are black too */
+ 	}

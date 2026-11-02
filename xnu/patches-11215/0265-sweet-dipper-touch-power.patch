@@ -1,0 +1,63 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c	2026-11-01 23:22:26.000000000 +0300
++++ b/bsd/dev/sweet_rpmh.c	2026-11-02 13:35:11.160772631 +0300
+@@ -416,9 +416,12 @@
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/* Board-specific helper: accept the two LDOs we know how to drive.
++	 *   ldoc11  - sweet (PM6150 LDO11C, 3.2V, PMIC5)
++	 *   ldoa28  - dipper (PM8998 LDO28, 3.3V, PMIC4) */
++	if (!res || (strcmp(res, "ldoc11") && strcmp(res, "ldoa28")) ||
++	    mv < 2950 || mv > 3400) {
++		printf("SWEET RPMH: expected ldoc11/ldoa28 and 2950..3400 mV\n");
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-01 23:22:28.000000000 +0300
++++ b/bsd/dev/sweet_touch.c	2026-11-02 13:35:11.160271356 +0300
+@@ -1040,6 +1040,19 @@
+ 	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)));
+ 	/* fts,irq-flags = 0x2008: ONESHOT | TRIGGER_LOW, so idle high, low = event */
+ 	touch_gpio(tb->irq, 0, 3, 0, false, false);
++	/* Mi 8 touch rails: AVDD = PM8998 LDOA28 (3.3V), VDDIO = TLMM GPIO 23 (1.8V).
++	 * Enable AVDD first, then VDDIO, per vendor bring-up order. */
++	if (!st.bitbang) {
++		int power_error = sweet_rpmh_vreg_enable("ldoa28", 3300);
++		if (power_error) {
++			printf("SWEET TOUCH: LDOA28 RPMh enable failed %d; touching blind\n",
++			    power_error);
++		} else {
++			touch_wait(10);
++		}
++		touch_gpio(23, 0, 0, 0, true, true);    /* VDDIO 1.8V, active high */
++		touch_wait(10);
++	}
+ 	if (st.bitbang) {
+ 		touch_gpio(tb->sda, 0, 0, 0, false, false);
+ 		touch_gpio(tb->scl, 0, 0, 0, false, false);
+@@ -1051,6 +1064,10 @@
+ 	}
+ 	touch_gpio(tb->rst, 0, 0, 0, true, true);         /* reset released */
+ 	touch_wait(50);
++	/* Ensure the panel/display rails that also feed touch are settled (best effort). */
++	if (!st.bitbang) {
++		touch_wait(50);
++	}
+ 	st.probing = true;
+ 	int err = touch_st_info(info);
+ 	if (err) {
+@@ -1072,6 +1089,9 @@
+ 		st.probing = false;
+ 		return false;
+ 	}
++	/* Wake the controller (it enters SLEEP_IN after power-on), then drain. */
++	(void)touch_msg(ST_ADDR, (const uint8_t[]){0x91}, 1, NULL, 0, false);   /* SLEEP_OUT */
++	touch_wait(50);
+ 	/* Drain the stack (CONTROLLER_READY after a reset, ABL leftovers), then sense. */
+ 	uint8_t drain[ST_EVENT_SIZE * ST_EVENTS_PER_READ];
+ 	for (unsigned i = 0; i < 4; ++i) {

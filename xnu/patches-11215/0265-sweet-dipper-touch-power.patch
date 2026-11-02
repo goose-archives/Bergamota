@@ -61,3 +61,4 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	/* Drain the stack (CONTROLLER_READY after a reset, ABL leftovers), then sense. */
  	uint8_t drain[ST_EVENT_SIZE * ST_EVENTS_PER_READ];
  	for (unsigned i = 0; i < 4; ++i) {
+# 0265

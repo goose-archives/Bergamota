@@ -1,7 +1,64 @@
 diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
 --- a/bsd/dev/sweet_rpmh.c	2026-11-01 23:22:26.000000000 +0300
-+++ b/bsd/dev/sweet_rpmh.c	2026-11-02 13:35:11.160772631 +0300
-@@ -416,9 +416,12 @@
++++ b/bsd/dev/sweet_rpmh.c	2026-11-03 13:01:00.596459087 +0300
+@@ -28,6 +28,14 @@
+ #define RH_BE_TCS_PA    0x179e0d00u
+ #define RH_BE_DB_PA     0x85fe0000u
+ #define RH_BE_DB_SIZE   0x20000u
++/*
++ * Dipper (Mi 8): its DT cmd-db node is qcom,cmd-db@861e0000 with
++ * reg = <0x0c3f000c 0x08>, i.e. the IMEM locator, exactly like sweet. The
++ * beryllium carve-out above is Poco-F1 specific and must not be used here.
++ * 0x861e0000 is the address the locator normally holds, kept as a fallback.
++ */
++#define RH_DIPPER_DB_PA   0x861e0000u
++#define RH_DIPPER_DB_SIZE 0x20000u
+ #define RH_TCS_SIZE     0x3000u
+ #define RH_DICT_PA      0x0c3f000cu
+ #define RH_DRV          2u
+@@ -114,16 +122,19 @@
+ rh_map(void)
+ {
+ 	rh_be = sweet_board_beryllium();
++	/* The RSC/TCS registers are the same on both SDM845 phones, but only
++	 * beryllium uses a fixed cmd-db carve-out; dipper must read the locator. */
++	bool fixed_db = rh_be && !sweet_board_dipper();
+ 	if (!rh_rsc) {
+ 		rh_rsc = ml_io_map(rh_be ? RH_BE_RSC_PA : RH_RSC_PA, 0x100);
+ 	}
+ 	if (!rh_tcs) {
+ 		rh_tcs = ml_io_map(rh_be ? RH_BE_TCS_PA : RH_TCS_PA, RH_TCS_SIZE);
+ 	}
+-	if (!rh_dict && !rh_be) {
++	if (!rh_dict && !fixed_db) {
+ 		rh_dict = ml_io_map(RH_DICT_PA, 8);
+ 	}
+-	if (!rh_rsc || !rh_tcs || (!rh_dict && !rh_be)) {
++	if (!rh_rsc || !rh_tcs || (!rh_dict && !fixed_db)) {
+ 		printf("SWEET RPMH: RSC/locator mapping failed\n");
+ 		return ENOMEM;
+ 	}
+@@ -144,9 +155,16 @@
+ 		return ENODEV;
+ 	}
+ 	if (!rh_db) {
+-		uint32_t pa = rh_be ? RH_BE_DB_PA : rh_read(rh_dict, 0);
+-		uint32_t size = rh_be ? RH_BE_DB_SIZE : rh_read(rh_dict, 4);
+-		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", rh_be ? 0u : RH_DICT_PA, pa, size);
++		uint32_t pa = fixed_db ? RH_BE_DB_PA : rh_read(rh_dict, 0);
++		uint32_t size = fixed_db ? RH_BE_DB_SIZE : rh_read(rh_dict, 4);
++		printf("SWEET RPMH: cmd-db %s=%#x pa=%#x size=%#x\n",
++		    fixed_db ? "carve-out" : "locator", fixed_db ? 0u : RH_DICT_PA, pa, size);
++		if (!fixed_db && (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
++		    size < RH_DB_HEADER || size > RH_DB_MAX)) {
++			pa = RH_DIPPER_DB_PA;
++			size = RH_DIPPER_DB_SIZE;
++			printf("SWEET RPMH: locator unusable, trying %#x\n", pa);
++		}
+ 		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
+ 		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+ 		    size < RH_DB_HEADER || size > RH_DB_MAX ||
+@@ -416,9 +434,12 @@
  int
  sweet_rpmh_vreg_enable(const char *res, unsigned mv)
  {
@@ -19,8 +76,30 @@ diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
  	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 --- a/bsd/dev/sweet_touch.c	2026-11-01 23:22:28.000000000 +0300
-+++ b/bsd/dev/sweet_touch.c	2026-11-02 13:35:11.160271356 +0300
-@@ -1040,6 +1040,19 @@
++++ b/bsd/dev/sweet_touch.c	2026-11-03 13:00:50.465902063 +0300
+@@ -199,8 +199,11 @@
+ 	uint32_t cfg = touch_rd(st.gpio, off);
+ 	if (out) {
+ 		/* Set the desired latch before enabling output (reset is active low). */
++		/* TLMM GPIO_IN_OUT: bit 0 is the output latch, bit 1 is the
++		 * read-only input level. Writing bit 1 does nothing, which used
++		 * to leave the reset pin asserted forever. */
+ 		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
+-		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~1u) | (high ? 1u : 0u));
+ 	}
+ 	cfg &= ~0x3ffu;
+ 	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+@@ -396,7 +399,7 @@
+ 	if (high) {
+ 		touch_wr(st.gpio, off, touch_rd(st.gpio, off) & ~0x200u);    /* release */
+ 	} else {
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(pin), touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u);
++		touch_wr(st.gpio, TOUCH_GPIO_IO(pin), touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~1u);
+ 		touch_wr(st.gpio, off, touch_rd(st.gpio, off) | 0x200u);     /* drive low */
+ 	}
+ }
+@@ -1040,6 +1043,21 @@
  	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)));
  	/* fts,irq-flags = 0x2008: ONESHOT | TRIGGER_LOW, so idle high, low = event */
  	touch_gpio(tb->irq, 0, 3, 0, false, false);
@@ -29,29 +108,36 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	if (!st.bitbang) {
 +		int power_error = sweet_rpmh_vreg_enable("ldoa28", 3300);
 +		if (power_error) {
-+			printf("SWEET TOUCH: LDOA28 RPMh enable failed %d; touching blind\n",
++			printf("SWEET TOUCH: LDOA28 RPMh enable failed %d; continuing\n",
 +			    power_error);
-+		} else {
-+			touch_wait(10);
 +		}
-+		touch_gpio(23, 0, 0, 0, true, true);    /* VDDIO 1.8V, active high */
++		/* disp_vddio_vreg: TLMM GPIO 23, active high (dtb). */
++		touch_gpio(23, 0, 0, 0, true, true);
 +		touch_wait(10);
++		printf("SWEET TOUCH: dipper power: ldoa28=%d vddio23 cfg=%#x io=%#x\n",
++		    power_error, touch_rd(st.gpio, TOUCH_GPIO_CFG(23)),
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(23)));
 +	}
  	if (st.bitbang) {
  		touch_gpio(tb->sda, 0, 0, 0, false, false);
  		touch_gpio(tb->scl, 0, 0, 0, false, false);
-@@ -1051,6 +1064,10 @@
+@@ -1049,8 +1067,14 @@
+ 		touch_gpio(tb->sda, tb->mux, 0, 0, false, false);
+ 		touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
  	}
++	/* Vendor fts_system_reset: hold reset low 10 ms, then let go. */
++	touch_gpio(tb->rst, 0, 0, 0, true, false);
++	touch_wait(10);
  	touch_gpio(tb->rst, 0, 0, 0, true, true);         /* reset released */
- 	touch_wait(50);
-+	/* Ensure the panel/display rails that also feed touch are settled (best effort). */
-+	if (!st.bitbang) {
-+		touch_wait(50);
-+	}
+-	touch_wait(50);
++	touch_wait(100);
++	printf("SWEET TOUCH: dipper reset released: rst%u cfg=%#x io=%#x\n",
++	    tb->rst, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->rst)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(tb->rst)));
  	st.probing = true;
  	int err = touch_st_info(info);
  	if (err) {
-@@ -1072,6 +1089,9 @@
+@@ -1072,6 +1096,9 @@
  		st.probing = false;
  		return false;
  	}
@@ -61,4 +147,3 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	/* Drain the stack (CONTROLLER_READY after a reset, ABL leftovers), then sense. */
  	uint8_t drain[ST_EVENT_SIZE * ST_EVENTS_PER_READ];
  	for (unsigned i = 0; i < 4; ++i) {
-# 0265

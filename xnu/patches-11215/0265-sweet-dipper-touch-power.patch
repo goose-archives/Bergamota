@@ -76,52 +76,75 @@ diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
  	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 --- a/bsd/dev/sweet_touch.c	2026-11-01 23:22:28.000000000 +0300
-+++ b/bsd/dev/sweet_touch.c	2026-11-03 13:00:50.465902063 +0300
-@@ -199,8 +199,11 @@
- 	uint32_t cfg = touch_rd(st.gpio, off);
++++ b/bsd/dev/sweet_touch.c	2026-11-03 13:19:57.230832014 +0300
+@@ -146,7 +146,7 @@
+ #define SE_PACK1        0x000ffefeu
+ 
+ static struct {
+-	vm_offset_t se, gcc, gpio;
++	vm_offset_t se, gcc, gpio, gpio_s;/* gpio = NORTH bank, gpio_s = SOUTH */
+ 	bool started, dead, probing, bitbang;
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+@@ -193,18 +193,25 @@
+ }
+ 
+ static void
+-touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++touch_gpio_base(vm_offset_t base, unsigned pin, unsigned mux, unsigned pull,
++    unsigned drive, bool out, bool high)
+ {
+ 	uint32_t off = TOUCH_GPIO_CFG(pin);
+-	uint32_t cfg = touch_rd(st.gpio, off);
++	uint32_t cfg = touch_rd(base, off);
  	if (out) {
  		/* Set the desired latch before enabling output (reset is active low). */
-+		/* TLMM GPIO_IN_OUT: bit 0 is the output latch, bit 1 is the
-+		 * read-only input level. Writing bit 1 does nothing, which used
-+		 * to leave the reset pin asserted forever. */
- 		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
 -		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
-+		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~1u) | (high ? 1u : 0u));
++		touch_wr(base, TOUCH_GPIO_IO(pin),
++		    (touch_rd(base, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
  	}
  	cfg &= ~0x3ffu;
  	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
-@@ -396,7 +399,7 @@
- 	if (high) {
- 		touch_wr(st.gpio, off, touch_rd(st.gpio, off) & ~0x200u);    /* release */
- 	} else {
--		touch_wr(st.gpio, TOUCH_GPIO_IO(pin), touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u);
-+		touch_wr(st.gpio, TOUCH_GPIO_IO(pin), touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~1u);
- 		touch_wr(st.gpio, off, touch_rd(st.gpio, off) | 0x200u);     /* drive low */
- 	}
+-	touch_wr(st.gpio, off, cfg);
++	touch_wr(base, off, cfg);
++}
++
++static void
++touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++{
++	touch_gpio_base(st.gpio, pin, mux, pull, drive, out, high);
  }
-@@ -1040,6 +1043,21 @@
+ 
+ static bool
+@@ -1040,6 +1047,26 @@
  	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)));
  	/* fts,irq-flags = 0x2008: ONESHOT | TRIGGER_LOW, so idle high, low = event */
  	touch_gpio(tb->irq, 0, 3, 0, false, false);
-+	/* Mi 8 touch rails: AVDD = PM8998 LDOA28 (3.3V), VDDIO = TLMM GPIO 23 (1.8V).
-+	 * Enable AVDD first, then VDDIO, per vendor bring-up order. */
-+	if (!st.bitbang) {
-+		int power_error = sweet_rpmh_vreg_enable("ldoa28", 3300);
-+		if (power_error) {
-+			printf("SWEET TOUCH: LDOA28 RPMh enable failed %d; continuing\n",
-+			    power_error);
-+		}
-+		/* disp_vddio_vreg: TLMM GPIO 23, active high (dtb). */
-+		touch_gpio(23, 0, 0, 0, true, true);
++	/* Mi 8 touch rails (dtb): AVDD = PM8998 LDOA28 3.3 V, VDDIO =
++	 * disp_vddio_vreg = TLMM GPIO 23, active high. GPIO 23 lives in the
++	 * TLMM SOUTH bank (0x03900000 + 0x400000); st.gpio maps NORTH only.
++	 * Vendor order: AVDD, then VDDIO, then >= 2 ms, then reset. */
++	int power_error = sweet_rpmh_vreg_enable("ldoa28", 3300);
++	if (power_error) {
++		printf("SWEET TOUCH: LDOA28 RPMh enable failed %d; continuing\n", power_error);
++	}
++	if (!st.gpio_s) {
++		st.gpio_s = ml_io_map(TOUCH_NORTH_PA + 0x400000u, 0x5b000);
++	}
++	if (st.gpio_s) {
++		touch_gpio_base(st.gpio_s, 23, 0, 0, 0, true, true);
 +		touch_wait(10);
 +		printf("SWEET TOUCH: dipper power: ldoa28=%d vddio23 cfg=%#x io=%#x\n",
-+		    power_error, touch_rd(st.gpio, TOUCH_GPIO_CFG(23)),
-+		    touch_rd(st.gpio, TOUCH_GPIO_IO(23)));
++		    power_error, touch_rd(st.gpio_s, TOUCH_GPIO_CFG(23)),
++		    touch_rd(st.gpio_s, TOUCH_GPIO_IO(23)));
++	} else {
++		printf("SWEET TOUCH: dipper power: SOUTH TLMM mapping failed\n");
 +	}
  	if (st.bitbang) {
  		touch_gpio(tb->sda, 0, 0, 0, false, false);
  		touch_gpio(tb->scl, 0, 0, 0, false, false);
-@@ -1049,8 +1067,14 @@
+@@ -1049,8 +1076,14 @@
  		touch_gpio(tb->sda, tb->mux, 0, 0, false, false);
  		touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
  	}
@@ -137,7 +160,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	st.probing = true;
  	int err = touch_st_info(info);
  	if (err) {
-@@ -1072,6 +1096,9 @@
+@@ -1072,6 +1105,9 @@
  		st.probing = false;
  		return false;
  	}

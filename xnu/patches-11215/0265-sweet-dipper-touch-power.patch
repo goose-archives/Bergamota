@@ -76,7 +76,7 @@ diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
  	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 --- a/bsd/dev/sweet_touch.c	2026-11-01 23:22:28.000000000 +0300
-+++ b/bsd/dev/sweet_touch.c	2026-11-03 13:43:14.579852994 +0300
++++ b/bsd/dev/sweet_touch.c	2026-11-03 19:07:18.827416617 +0300
 @@ -70,9 +70,13 @@
  #define ST_READ_INFO      0x80u
  #define ST_READ_STATUS    0x84u
@@ -157,10 +157,128 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	st.irq_status = st.irq_last = 0;
  	st.sent = st.got = 0;
  	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
-@@ -1029,6 +1055,47 @@
+@@ -384,8 +410,9 @@
+  * the bus is bit-banged on its own pins as plain GPIOs: open drain by
+  * switching output enable (the board pulls SDA/SCL up), ~100 kHz.
+  */
+-/* Half clock period in us: 5 = ~100 kHz (default); boot-arg sweettouchbb=2..5 is faster */
+-static unsigned bb_half_us = 5u;
++/* Half clock period in us: 5 = ~100 kHz, 10 = ~50 kHz (bring-up default) */
++static unsigned bb_half_us = 10u;
++static bool bb_verbose;
+ #define BB_HALF_US bb_half_us
+ /* Poll period of the touch thread in ms (IRQ latch check; reads only on edges or while down) */
+ static unsigned touch_poll_ms = 10u;
+@@ -462,6 +489,7 @@
+ 	if (!bb_scl_high()) {
+ 		return ETIMEDOUT;
+ 	}
++	delay(BB_HALF_US);
+ 	bool nack = bb_get(tb->sda);
+ 	bb_line(tb->scl, false);
+ 	delay(BB_HALF_US);
+@@ -478,6 +506,8 @@
+ 		if (!bb_scl_high()) {
+ 			return ETIMEDOUT;
+ 		}
++		/* Let a slow pull-up finish rising before sampling the bit. */
++		delay(BB_HALF_US);
+ 		x |= (uint8_t)(bb_get(tb->sda) << b);
+ 		bb_line(tb->scl, false);
+ 	}
+@@ -492,9 +522,12 @@
+ 	return 0;
+ }
+ 
++static void bb_recover(void);
++
+ static int
+ bb_xfer(uint8_t addr, const uint8_t *reg, unsigned nreg, uint8_t *buf, unsigned len)
+ {
++	bb_recover();
+ 	int err = bb_start() ? 0 : ETIMEDOUT;
+ 	if (!err) {
+ 		err = bb_write((uint8_t)(addr << 1));
+@@ -512,13 +545,61 @@
+ 		}
+ 	}
+ 	bb_stop();
+-	if (st.probing) {
++	if (st.probing && bb_verbose) {
+ 		printf("SWEET TOUCH: bb addr=%#x reg=%#x len=%u err=%d sda=%d scl=%d\n",
+ 		    addr, nreg ? reg[0] : 0, len, err, bb_get(tb->sda), bb_get(tb->scl));
+ 	}
+ 	return err;
+ }
+ 
++/* Free a slave that is holding SDA low (mid-byte after a lost STOP). */
++static void
++bb_recover(void)
++{
++	if (bb_get(tb->sda) && bb_get(tb->scl)) {
++		return;
++	}
++	bb_line(tb->sda, true);
++	for (unsigned i = 0; i < 9; ++i) {
++		bb_line(tb->scl, false);
++		delay(BB_HALF_US);
++		bb_line(tb->scl, true);
++		delay(BB_HALF_US);
++	}
++	bb_stop();
++}
++
++/* Address-only write: START, addr+W, STOP. No register byte is sent. */
++static bool
++bb_probe(uint8_t addr)
++{
++	if (!bb_start()) {
++		return false;
++	}
++	bool ack = bb_write((uint8_t)(addr << 1)) == 0;
++	bb_stop();
++	return ack;
++}
++
++/* How many microseconds does a released line need to read high? */
++static void
++bb_rise_test(const char *name, unsigned pin)
++{
++	touch_wr(st.gpio, TOUCH_GPIO_IO(pin), touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u);
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(pin), touch_rd(st.gpio, TOUCH_GPIO_CFG(pin)) | 0x200u);
++	delay(20);
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(pin), touch_rd(st.gpio, TOUCH_GPIO_CFG(pin)) & ~0x200u);
++	for (unsigned us = 0; us < 60; ++us) {
++		if (bb_get(pin)) {
++			printf("SWEET TOUCH: rise %s %uus (cfg=%#x)\n", name, us,
++			    touch_rd(st.gpio, TOUCH_GPIO_CFG(pin)));
++			return;
++		}
++		delay(1);
++	}
++	printf("SWEET TOUCH: rise %s still low after 60us\n", name);
++}
++
+ static int
+ touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
+ {
+@@ -1029,6 +1110,66 @@
  	return touch_read(MXT_ADDR, 0, false, &id, 1);
  }
  
++/* Raw register read, printed as bytes, for bring-up diagnosis. */
++static void
++touch_st_raw(const char *tag, uint8_t reg, bool wide)
++{
++	uint8_t b[8];
++	uint8_t ptr[2] = {reg, 0};
++	int err = bb_xfer(ST_ADDR, ptr, wide ? 2u : 1u, b, sizeof b);
++	printf("SWEET TOUCH: raw %s %#x %s err=%d sda=%d scl=%d:"
++	    " %02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    tag, reg, wide ? "p2" : "p1", err, bb_get(tb->sda), bb_get(tb->scl),
++	    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++}
++
 +/*
 + * Send one ST command and wait for the controller event Linux treats as its
 + * completion (struct stmfts_data::cmd_done): CONTROLLER_READY 0x10,
@@ -175,12 +293,18 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	if (err) {
 +		return err;
 +	}
++	bool shown = false;
 +	for (unsigned i = 0; i < 100; ++i) {
 +		uint8_t ev[ST_EVENT_SIZE * ST_EVENTS_PER_READ];
 +		touch_wait(10);
 +		memset(ev, 0, sizeof ev);
 +		if (touch_read(ST_ADDR, ST_READ_ALL_EVENT, false, ev, sizeof ev)) {
 +			return 0;        /* controller is still rebooting */
++		}
++		if (!shown && st.probing) {
++			shown = true;
++			printf("SWEET TOUCH: ST cmd %#x ev=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    cmd, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
 +		}
 +		for (unsigned j = 0; j < ST_EVENTS_PER_READ; ++j) {
 +			uint8_t e = ev[j * ST_EVENT_SIZE];
@@ -205,7 +329,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  static bool
  touch_dipper_start(void)
  {
-@@ -1040,6 +1107,26 @@
+@@ -1040,6 +1181,26 @@
  	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)));
  	/* fts,irq-flags = 0x2008: ONESHOT | TRIGGER_LOW, so idle high, low = event */
  	touch_gpio(tb->irq, 0, 3, 0, false, false);
@@ -232,7 +356,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	if (st.bitbang) {
  		touch_gpio(tb->sda, 0, 0, 0, false, false);
  		touch_gpio(tb->scl, 0, 0, 0, false, false);
-@@ -1049,45 +1136,53 @@
+@@ -1049,45 +1210,80 @@
  		touch_gpio(tb->sda, tb->mux, 0, 0, false, false);
  		touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
  	}
@@ -254,7 +378,26 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 -		touch_gpio(tb->rst, 0, 0, 0, true, true);
 -		touch_wait(300);
 -		err = touch_st_info(info);
--	}
++	if (st.bitbang) {
++		/* Electrical facts first: pull-ups and a bus scan. */
++		bb_rise_test("sda", tb->sda);
++		bb_rise_test("scl", tb->scl);
++		printf("SWEET TOUCH: scan");
++		for (unsigned a = 0x08; a < 0x78; ++a) {
++			if (bb_probe((uint8_t)a)) {
++				printf(" %#x", a);
++			}
++		}
++		printf("\n");
++		/* Registers straight after reset, before any command is written. */
++		bb_verbose = true;
++		touch_st_raw("post-reset", ST_READ_INFO, false);
++		touch_st_raw("post-reset", ST_READ_STATUS, false);
++		touch_st_raw("post-reset", ST_READ_ALL_EVENT, false);
++		touch_st_raw("post-reset", ST_READ_INFO, true);
++		touch_st_raw("post-reset", ST_READ_ALL_EVENT, true);
++		bb_verbose = false;
+ 	}
 -	printf("SWEET TOUCH: probe ST FTS at %#x: err=%d fw=%u chip=%#x raw=%02x %02x %02x %02x\n",
 -	    ST_ADDR, err, touch_be16(info + 2), touch_be16(info + 6),
 -	    info[0], info[1], info[2], info[3]);
@@ -285,6 +428,13 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 -		    drain[0] == ST_EV_NO_EVENT) {
 -			break;
 -		}
++	if (st.bitbang) {
++		bb_verbose = true;
++		touch_st_raw("after-wake", ST_READ_INFO, false);
++		touch_st_raw("after-wake", ST_READ_STATUS, false);
++		touch_st_raw("after-wake", ST_READ_ALL_EVENT, false);
++		bb_verbose = false;
++	}
 +	int rst = touch_st_cmd(ST_SYSTEM_RESET);
 +	if (rst) {
 +		printf("SWEET TOUCH: ST FTS SYSTEM_RESET err=%d\n", rst);

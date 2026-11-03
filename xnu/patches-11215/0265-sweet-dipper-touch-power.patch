@@ -76,8 +76,22 @@ diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
  	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 --- a/bsd/dev/sweet_touch.c	2026-11-01 23:22:28.000000000 +0300
-+++ b/bsd/dev/sweet_touch.c	2026-11-03 13:19:57.230832014 +0300
-@@ -146,7 +146,7 @@
++++ b/bsd/dev/sweet_touch.c	2026-11-03 13:43:14.579852994 +0300
+@@ -70,9 +70,13 @@
+ #define ST_READ_INFO      0x80u
+ #define ST_READ_STATUS    0x84u
+ #define ST_READ_ALL_EVENT 0x86u
++#define ST_SLEEP_OUT      0x91u
+ #define ST_MT_SENSE_ON    0x93u
+ #define ST_SYSTEM_RESET   0xa0u
+ #define ST_CLEAR_EVENTS   0xa1u
++#define ST_FORCE_CAL      0xa2u
++#define ST_MS_CX_TUNING   0xa3u
++#define ST_SS_CX_TUNING   0xa4u
+ #define ST_INFO_LEN       8u
+ #define ST_STATUS_LEN     4u
+ #define ST_EVENT_SIZE     8u
+@@ -146,7 +150,7 @@
  #define SE_PACK1        0x000ffefeu
  
  static struct {
@@ -86,7 +100,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	bool started, dead, probing, bitbang;
  	int kind, irq_hint;
  	uint32_t irq_status, irq_last, active;
-@@ -193,18 +193,25 @@
+@@ -193,18 +197,25 @@
  }
  
  static void
@@ -117,7 +131,81 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  }
  
  static bool
-@@ -1040,6 +1047,26 @@
+@@ -362,10 +373,25 @@
+ 	return err;
+ }
+ 
++static int bb_xfer(uint8_t addr, const uint8_t *reg, unsigned nreg,
++    uint8_t *buf, unsigned len);
++
+ static int
+ touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
++	/*
++	 * SE14 on dipper runs GSI-only firmware: its FIFO interface is disabled
++	 * and the GENI command path below never completes. Worse, touch_abort()
++	 * then sets st.dead, which stops the polling thread entirely. Dipper
++	 * talks to the controller over the same bit-banged pins as touch_read().
++	 */
++	if (st.bitbang) {
++		if (nr || !nt || nt > 2) {
++			return EINVAL;
++		}
++		return bb_xfer(addr, tx, nt, NULL, 0);
++	}
+ 	st.irq_status = st.irq_last = 0;
+ 	st.sent = st.got = 0;
+ 	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
+@@ -1029,6 +1055,47 @@
+ 	return touch_read(MXT_ADDR, 0, false, &id, 1);
+ }
+ 
++/*
++ * Send one ST command and wait for the controller event Linux treats as its
++ * completion (struct stmfts_data::cmd_done): CONTROLLER_READY 0x10,
++ * SLEEP_OUT_CONTROLLER_READY 0x11 or STATUS 0x16. Returns 0 on ACK, an errno
++ * when the write itself was NACKed.
++ */
++static int
++touch_st_cmd(uint8_t cmd)
++{
++	int err = touch_msg(ST_ADDR, &cmd, 1, NULL, 0, false);
++
++	if (err) {
++		return err;
++	}
++	for (unsigned i = 0; i < 100; ++i) {
++		uint8_t ev[ST_EVENT_SIZE * ST_EVENTS_PER_READ];
++		touch_wait(10);
++		memset(ev, 0, sizeof ev);
++		if (touch_read(ST_ADDR, ST_READ_ALL_EVENT, false, ev, sizeof ev)) {
++			return 0;        /* controller is still rebooting */
++		}
++		for (unsigned j = 0; j < ST_EVENTS_PER_READ; ++j) {
++			uint8_t e = ev[j * ST_EVENT_SIZE];
++			if (e == ST_EV_NO_EVENT) {
++				break;
++			}
++			if (e == 0x10u || e == 0x11u || e == 0x16u) {
++				if (st.probing) {
++					printf("SWEET TOUCH: ST cmd %#x -> event %#x\n",
++					    cmd, e);
++				}
++				return 0;
++			}
++		}
++	}
++	if (st.probing) {
++		printf("SWEET TOUCH: ST cmd %#x: no completion event\n", cmd);
++	}
++	return 0;
++}
++
+ static bool
+ touch_dipper_start(void)
+ {
+@@ -1040,6 +1107,26 @@
  	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)));
  	/* fts,irq-flags = 0x2008: ONESHOT | TRIGGER_LOW, so idle high, low = event */
  	touch_gpio(tb->irq, 0, 3, 0, false, false);
@@ -144,7 +232,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	if (st.bitbang) {
  		touch_gpio(tb->sda, 0, 0, 0, false, false);
  		touch_gpio(tb->scl, 0, 0, 0, false, false);
-@@ -1049,8 +1076,14 @@
+@@ -1049,45 +1136,53 @@
  		touch_gpio(tb->sda, tb->mux, 0, 0, false, false);
  		touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
  	}
@@ -158,15 +246,70 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	    tb->rst, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->rst)),
 +	    touch_rd(st.gpio, TOUCH_GPIO_IO(tb->rst)));
  	st.probing = true;
- 	int err = touch_st_info(info);
- 	if (err) {
-@@ -1072,6 +1105,9 @@
+-	int err = touch_st_info(info);
+-	if (err) {
+-		printf("SWEET TOUCH: ST FTS silent (%d); pulsing reset\n", err);
+-		touch_gpio(tb->rst, 0, 0, 0, true, false);
+-		touch_wait(10);
+-		touch_gpio(tb->rst, 0, 0, 0, true, true);
+-		touch_wait(300);
+-		err = touch_st_info(info);
+-	}
+-	printf("SWEET TOUCH: probe ST FTS at %#x: err=%d fw=%u chip=%#x raw=%02x %02x %02x %02x\n",
+-	    ST_ADDR, err, touch_be16(info + 2), touch_be16(info + 6),
+-	    info[0], info[1], info[2], info[3]);
+-	if (err || st.dead) {
++	/*
++	 * Linux stmfts_power_on(): the controller ACKs as soon as VDDIO is up
++	 * but idles in SLEEP_IN, so register reads return zeros until it is
++	 * woken. Wake it, then run stmfts_configure(): SYSTEM_RESET, SLEEP_OUT,
++	 * the two optional tunings and the mandatory force calibration. Every
++	 * command posts a controller event; wait for it instead of guessing.
++	 */
++	int wake = touch_st_cmd(ST_SLEEP_OUT);
++	if (wake) {
+ 		int mxt = touch_st_present();
+-		printf("SWEET TOUCH: no ST FTS at %#x (err=%d dead=%d); Atmel MXT at %#x err=%d%s\n",
+-		    ST_ADDR, err, st.dead, MXT_ADDR, mxt,
++		printf("SWEET TOUCH: no ST FTS at %#x (wake err=%d); Atmel MXT at %#x err=%d%s\n",
++		    ST_ADDR, wake, MXT_ADDR, mxt,
+ 		    mxt ? "" : " (present, no driver yet)");
  		st.probing = false;
  		return false;
  	}
-+	/* Wake the controller (it enters SLEEP_IN after power-on), then drain. */
-+	(void)touch_msg(ST_ADDR, (const uint8_t[]){0x91}, 1, NULL, 0, false);   /* SLEEP_OUT */
-+	touch_wait(50);
- 	/* Drain the stack (CONTROLLER_READY after a reset, ABL leftovers), then sense. */
- 	uint8_t drain[ST_EVENT_SIZE * ST_EVENTS_PER_READ];
- 	for (unsigned i = 0; i < 4; ++i) {
+-	/* Drain the stack (CONTROLLER_READY after a reset, ABL leftovers), then sense. */
+-	uint8_t drain[ST_EVENT_SIZE * ST_EVENTS_PER_READ];
+-	for (unsigned i = 0; i < 4; ++i) {
+-		memset(drain, 0, sizeof drain);
+-		if (touch_read(ST_ADDR, ST_READ_ALL_EVENT, false, drain, sizeof drain) ||
+-		    drain[0] == ST_EV_NO_EVENT) {
+-			break;
+-		}
++	int rst = touch_st_cmd(ST_SYSTEM_RESET);
++	if (rst) {
++		printf("SWEET TOUCH: ST FTS SYSTEM_RESET err=%d\n", rst);
++	}
++	(void)touch_st_cmd(ST_SLEEP_OUT);
++	(void)touch_st_cmd(ST_MS_CX_TUNING);      /* optional, as in Linux */
++	(void)touch_st_cmd(ST_SS_CX_TUNING);      /* optional, as in Linux */
++	int cal = touch_st_cmd(ST_FORCE_CAL);
++	if (cal) {
++		printf("SWEET TOUCH: ST FTS force calibration err=%d\n", cal);
+ 	}
+-	int ce = touch_msg(ST_ADDR, (const uint8_t[]){ST_CLEAR_EVENTS}, 1, NULL, 0, false);
++	(void)touch_msg(ST_ADDR, (const uint8_t[]){ST_CLEAR_EVENTS}, 1, NULL, 0, false);
+ 	touch_wait(20);
+ 	int se = touch_msg(ST_ADDR, (const uint8_t[]){ST_MT_SENSE_ON}, 1, NULL, 0, false);
+ 	touch_wait(30);
+ 	int st_err = touch_read(ST_ADDR, ST_READ_STATUS, false, status, sizeof status);
+-	printf("SWEET TOUCH: ST FTS clear=%d sense-on=%d status=%d/%#x\n",
+-	    ce, se, st_err, st_err ? 0 : status[0]);
++	int ierr = touch_st_info(info);
++	printf("SWEET TOUCH: ST FTS wake=%d reset=%d cal=%d sense-on=%d status=%d/%#x info=%d\n",
++	    wake, rst, cal, se, st_err, st_err ? 0 : status[0], ierr);
++	printf("SWEET TOUCH: ST info ver=%u fw=%u cfg=%u/%u chip=%#x raw=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    info[0], touch_be16(info + 2), info[4], info[5], touch_be16(info + 6),
++	    info[0], info[1], info[2], info[3], info[4], info[5], info[6], info[7]);
+ 	st.probing = false;
+ 	st.kind = TOUCH_ST;
+ 	return true;

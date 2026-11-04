@@ -76,7 +76,7 @@ diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
  	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 --- a/bsd/dev/sweet_touch.c	2026-11-01 23:22:28.000000000 +0300
-+++ b/bsd/dev/sweet_touch.c	2026-11-04 18:36:21.350648734 +0300
++++ b/bsd/dev/sweet_touch.c	2026-11-04 18:36:53.392266899 +0300
 @@ -31,6 +31,7 @@
  /* Mach MIG declaration is not included by BSD's exported thread.h. */
  extern kern_return_t thread_terminate(thread_t);
@@ -551,7 +551,12 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	return true;
  }
  
-@@ -1101,42 +1348,50 @@
+@@ -1097,46 +1344,54 @@
+ static int
+ touch_st(void)
+ {
+-	uint8_t buf[ST_EVENT_SIZE * ST_EVENTS_PER_READ];
++	uint8_t buf[ST_EVENT_SIZE * (ST_EVENTS_PER_READ + 1)];
  	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
  	uint32_t seen = 0, up = 0;
  

@@ -76,7 +76,7 @@ diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
  	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 --- a/bsd/dev/sweet_touch.c	2026-11-01 23:22:28.000000000 +0300
-+++ b/bsd/dev/sweet_touch.c	2026-11-04 11:57:40.442668876 +0300
++++ b/bsd/dev/sweet_touch.c	2026-11-04 12:19:53.413518405 +0300
 @@ -70,9 +70,13 @@
  #define ST_READ_INFO      0x80u
  #define ST_READ_STATUS    0x84u
@@ -377,7 +377,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	if (st.bitbang) {
  		touch_gpio(tb->sda, 0, 0, 0, false, false);
  		touch_gpio(tb->scl, 0, 0, 0, false, false);
-@@ -1049,45 +1231,98 @@
+@@ -1049,45 +1231,102 @@
  		touch_gpio(tb->sda, tb->mux, 0, 0, false, false);
  		touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
  	}
@@ -406,33 +406,38 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +		}
 +		printf("\n");
 +		/*
-+		 * Reset polarity ladder. Vendor fts_system_reset() drives the pin
-+		 * low to reset (high = running), mainline gpiod uses the inverted
-+		 * logical convention. Try both and watch the info register; a
-+		 * live core answers within a few hundred ms of leaving reset.
++		 * Vendor FTM3 map: HW registers are {0xB6, addr_hi, addr_lo, val}
++		 * and chip info lives in the framebuffer (0xD0, 16-bit word address).
++		 * Run the vendor's own power-on steps before the mainline stmfts
++		 * command set: enable interrupts, HW system reset, then wait for the
++		 * CONTROL_READY event.
 +		 */
++		uint8_t f[9];
  		touch_gpio(tb->rst, 0, 0, 0, true, false);
 -		touch_wait(10);
 +		touch_wait(20);
-+		touch_gpio(tb->rst, 0, 0, 0, true, true);
-+		touch_wait(50);
-+		touch_st_poll("rst-low");
-+		touch_gpio(tb->rst, 0, 0, 0, true, true);
-+		touch_wait(20);
-+		touch_gpio(tb->rst, 0, 0, 0, true, false);
-+		touch_wait(50);
-+		touch_st_poll("rst-high");
-+		/* Restore: assert low, release high, then give the core time. */
-+		touch_gpio(tb->rst, 0, 0, 0, true, false);
-+		touch_wait(20);
  		touch_gpio(tb->rst, 0, 0, 0, true, true);
- 		touch_wait(300);
+-		touch_wait(300);
 -		err = touch_st_info(info);
-+		bb_verbose = true;
-+		touch_st_raw("post-reset", ST_READ_INFO, false);
-+		touch_st_raw("post-reset", ST_READ_STATUS, false);
-+		touch_st_raw("post-reset", ST_READ_ALL_EVENT, false);
-+		bb_verbose = false;
++		touch_wait(100);
++		int ie = bb_xfer(ST_ADDR, (const uint8_t[]){0xb6, 0x00, 0x1c, 0x41}, 4, NULL, 0);
++		printf("SWEET TOUCH: HW IER=0x41 write err=%d irq=%d\n", ie, bb_get(tb->irq));
++		int sr = bb_xfer(ST_ADDR, (const uint8_t[]){0xb6, 0x00, 0x23, 0x01}, 4, NULL, 0);
++		printf("SWEET TOUCH: HW reset(0x23=0x01) err=%d\n", sr);
++		for (unsigned i = 0; i < 20; ++i) {
++			touch_wait(100);
++			memset(f, 0, sizeof f);
++			int e = bb_xfer(ST_ADDR, (const uint8_t[]){0x86}, 1, f, 8);
++			if (i < 3 || f[0] != 0x00) {
++				printf("SWEET TOUCH: fifo t=%ums err=%d irq=%d:"
++				    " %02x %02x %02x %02x %02x %02x %02x %02x\n", i * 100u, e,
++				    bb_get(tb->irq), f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
++			}
++		}
++		memset(f, 0, sizeof f);
++		int fe = bb_xfer(ST_ADDR, (const uint8_t[]){0xd0, 0x00, 0x00}, 3, f, 9);
++		printf("SWEET TOUCH: fb0 err=%d irq=%d: %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    fe, bb_get(tb->irq), f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]);
  	}
 -	printf("SWEET TOUCH: probe ST FTS at %#x: err=%d fw=%u chip=%#x raw=%02x %02x %02x %02x\n",
 -	    ST_ADDR, err, touch_be16(info + 2), touch_be16(info + 6),

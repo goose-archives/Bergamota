@@ -76,7 +76,7 @@ diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
  	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 --- a/bsd/dev/sweet_touch.c	2026-11-01 23:22:28.000000000 +0300
-+++ b/bsd/dev/sweet_touch.c	2026-11-03 19:07:18.827416617 +0300
++++ b/bsd/dev/sweet_touch.c	2026-11-04 11:57:40.442668876 +0300
 @@ -70,9 +70,13 @@
  #define ST_READ_INFO      0x80u
  #define ST_READ_STATUS    0x84u
@@ -262,10 +262,31 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  static int
  touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
  {
-@@ -1029,6 +1110,66 @@
+@@ -1029,6 +1110,87 @@
  	return touch_read(MXT_ADDR, 0, false, &id, 1);
  }
  
++/* Poll the info register across a boot window; irq tells if the core is alive. */
++static void
++touch_st_poll(const char *tag)
++{
++	uint8_t b[8];
++	for (unsigned i = 0; i < 20; ++i) {
++		memset(b, 0, sizeof b);
++		int e = bb_xfer(ST_ADDR, (const uint8_t[]){ST_READ_INFO}, 1, b, 8);
++		if (i == 0 || b[0] || b[1] || b[2] || b[3]) {
++			printf("SWEET TOUCH: %s t=%ums info err=%d irq=%d sda=%d:"
++			    " %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    tag, i * 100u, e, bb_get(tb->irq), bb_get(tb->sda),
++			    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++		}
++		if (b[0] || b[1] || b[2] || b[3]) {
++			return;
++		}
++		touch_wait(100);
++	}
++}
++
 +/* Raw register read, printed as bytes, for bring-up diagnosis. */
 +static void
 +touch_st_raw(const char *tag, uint8_t reg, bool wide)
@@ -329,7 +350,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  static bool
  touch_dipper_start(void)
  {
-@@ -1040,6 +1181,26 @@
+@@ -1040,6 +1202,26 @@
  	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)));
  	/* fts,irq-flags = 0x2008: ONESHOT | TRIGGER_LOW, so idle high, low = event */
  	touch_gpio(tb->irq, 0, 3, 0, false, false);
@@ -356,7 +377,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	if (st.bitbang) {
  		touch_gpio(tb->sda, 0, 0, 0, false, false);
  		touch_gpio(tb->scl, 0, 0, 0, false, false);
-@@ -1049,45 +1210,80 @@
+@@ -1049,45 +1231,98 @@
  		touch_gpio(tb->sda, tb->mux, 0, 0, false, false);
  		touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
  	}
@@ -373,11 +394,6 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 -	int err = touch_st_info(info);
 -	if (err) {
 -		printf("SWEET TOUCH: ST FTS silent (%d); pulsing reset\n", err);
--		touch_gpio(tb->rst, 0, 0, 0, true, false);
--		touch_wait(10);
--		touch_gpio(tb->rst, 0, 0, 0, true, true);
--		touch_wait(300);
--		err = touch_st_info(info);
 +	if (st.bitbang) {
 +		/* Electrical facts first: pull-ups and a bus scan. */
 +		bb_rise_test("sda", tb->sda);
@@ -389,13 +405,33 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +			}
 +		}
 +		printf("\n");
-+		/* Registers straight after reset, before any command is written. */
++		/*
++		 * Reset polarity ladder. Vendor fts_system_reset() drives the pin
++		 * low to reset (high = running), mainline gpiod uses the inverted
++		 * logical convention. Try both and watch the info register; a
++		 * live core answers within a few hundred ms of leaving reset.
++		 */
+ 		touch_gpio(tb->rst, 0, 0, 0, true, false);
+-		touch_wait(10);
++		touch_wait(20);
++		touch_gpio(tb->rst, 0, 0, 0, true, true);
++		touch_wait(50);
++		touch_st_poll("rst-low");
++		touch_gpio(tb->rst, 0, 0, 0, true, true);
++		touch_wait(20);
++		touch_gpio(tb->rst, 0, 0, 0, true, false);
++		touch_wait(50);
++		touch_st_poll("rst-high");
++		/* Restore: assert low, release high, then give the core time. */
++		touch_gpio(tb->rst, 0, 0, 0, true, false);
++		touch_wait(20);
+ 		touch_gpio(tb->rst, 0, 0, 0, true, true);
+ 		touch_wait(300);
+-		err = touch_st_info(info);
 +		bb_verbose = true;
 +		touch_st_raw("post-reset", ST_READ_INFO, false);
 +		touch_st_raw("post-reset", ST_READ_STATUS, false);
 +		touch_st_raw("post-reset", ST_READ_ALL_EVENT, false);
-+		touch_st_raw("post-reset", ST_READ_INFO, true);
-+		touch_st_raw("post-reset", ST_READ_ALL_EVENT, true);
 +		bb_verbose = false;
  	}
 -	printf("SWEET TOUCH: probe ST FTS at %#x: err=%d fw=%u chip=%#x raw=%02x %02x %02x %02x\n",

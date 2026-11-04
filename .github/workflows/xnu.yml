@@ -107,9 +107,9 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
-          # bearssl.org returns 502 for the clone URL with a trailing slash
-          sed -i '' 's|/git/BearSSL/|/git/BearSSL|g' dxb/build.sh
-          grep -c 'www.bearssl.org/git/BearSSL[^/]' dxb/build.sh || true
+          # bearssl.org is returning 502; status-im/BearSSL tracks upstream master exactly
+          sed -i '' 's|https://www.bearssl.org/git/BearSSL/*|https://github.com/status-im/BearSSL|g' dxb/build.sh
+          grep -c 'github.com/status-im/BearSSL' dxb/build.sh || true
           # dxb only warns and carries on when a patch does not apply; for ours that would silently
           # produce a kernel without it, so make it fatal.
           python3 - <<'PY'
